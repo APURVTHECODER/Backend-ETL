@@ -2,7 +2,7 @@
 # SECTION 1: FastAPI Upload Server
 # ==============================================================================
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request,APIRouter, Depends , Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.cloud import storage
@@ -11,11 +11,15 @@ from google.cloud.pubsub_v1 import PublisherClient
 from datetime import timedelta, timezone # Ensure timezone aware for consistency
 import os
 import logging
-import re
+from typing import List, Dict, Any  # Add Any here
 
+import re
+from google.cloud import bigquery
 import traceback
 from dotenv import load_dotenv
-
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from google.cloud import bigquery
 # --- Load Environment Variables ---
 # Load variables for both FastAPI and Worker sections if run together
 # Ensure .env file is in the directory where you run the script
@@ -23,7 +27,9 @@ load_dotenv()
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="ETL Upload API")
+router = APIRouter()
 
+api_bigquery_client = bigquery.Client()
 # --- FastAPI Logging Setup ---
 # Use uvicorn's logger if available, otherwise basic config
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -156,3 +162,51 @@ async def trigger_etl(payload: ETLRequest, request: Request):
     except Exception as e:
         logger_api.error(f"Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not trigger ETL: {e}")
+    
+
+class TableReference(BaseModel):
+    tableId: str
+
+
+@router.get("/api/bigquery/tables", response_model=List[TableReference])
+def list_bigquery_tables(dataset_id: str):
+    if not api_bigquery_client:
+        raise HTTPException(503, "BigQuery client not available")
+    if not dataset_id:
+        raise HTTPException(400, "dataset_id parameter is required")
+
+    try:
+        items = api_bigquery_client.list_tables(dataset_id)
+        # Only pull table_id, skip fetching full Table objects
+        return [TableReference(tableId=tbl.table_id) for tbl in items]
+    except Exception as e:
+        # handle dataset-not-found differently if you like
+        raise HTTPException(5)
+    # --- Include the router in the main app ---
+
+
+@router.get("/api/bigquery/table-data", response_model=List[Dict[str, Any]])
+def get_table_data(
+    dataset_id: str = Query(..., alias="dataset_id"),
+    table_id:   str = Query(..., alias="table_id"),
+    limit:      int = Query(50, description="Max number of rows to return"),
+):
+    """
+    Fetch up to `limit` rows from the given BigQuery table.
+    """
+    try:
+        full_table = f"{dataset_id}.{table_id}"
+        table_ref  = api_bigquery_client.get_table(full_table)
+        df         = api_bigquery_client.list_rows(table_ref, max_results=limit).to_dataframe()
+        return df.to_dict(orient="records")
+    except Exception as e:
+        logger_api.error(f"Error getting data for {full_table}: {e}", exc_info=True)
+        raise HTTPException(500, f"Could not fetch table data: {e}")
+
+
+app.include_router(router)
+
+# Optional: Add a root endpoint for basic testing
+@app.get("/")
+def read_root():
+    return {"message": "ETL Upload API is running."}
