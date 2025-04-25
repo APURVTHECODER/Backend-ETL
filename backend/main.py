@@ -204,6 +204,31 @@ def get_table_data(
         raise HTTPException(500, f"Could not fetch table data: {e}")
 
 
+
+
+class QueryRequest(BaseModel):
+    sql: str = Field(..., description="Only SELECT queries")
+
+@router.post("/api/bigquery/query", response_model=List[Dict[str,Any]])
+def run_sql(req: QueryRequest):
+    sql = req.sql.strip()
+    # only allow SELECT
+    if not sql.lower().startswith("select"):
+        raise HTTPException(400, "Only SELECT queries allowed")
+    try:
+        # DEBUG: print the SQL to your console
+        print("Running SQL:", sql)
+        job = api_bigquery_client.query(sql)      # ← use your BigQuery client
+        records = [dict(row) for row in job.result()]
+        return records
+    except Exception as e:
+        print("Query error:", e)
+        raise HTTPException(500, f"Query failed: {e}")
+
+
+
+
+
 app.include_router(router)
 
 # Optional: Add a root endpoint for basic testing
