@@ -391,8 +391,7 @@ async def trigger_etl(payload: ETLRequest, request: Request):
     except Exception as e: logger_api.error(f"Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
 
 
-# --- Include Routers ---
-app.include_router(bq_router)
+
 
 # --- Optional Health Check ---
 @app.get("/api/health", tags=["Health"])
@@ -413,6 +412,210 @@ async def health_check():
 @app.get("/", tags=["Root"], include_in_schema=False)
 def read_root():
     return {"message": f"{app.title} is running."}
+
+# main.py (or your FastAPI routes file)
+
+# --- Add these Pydantic models if they aren't already there ---
+class VizSuggestion(BaseModel):
+    chart_type: str # e.g., "bar", "line", "scatter", "pie"
+    x_axis_column: str
+    y_axis_columns: List[str]
+    rationale: Optional[str] = None
+
+class SuggestVizRequest(BaseModel):
+    schema_: List[Dict[str, Any]] = Field(..., alias="schema")
+    query_sql: Optional[str] = None
+    prompt: Optional[str] = None
+    result_sample: Optional[List[Dict[str, Any]]] = None
+
+class SuggestVizResponse(BaseModel):
+    suggestions: List[VizSuggestion]
+    error: Optional[str] = None
+
+# --- ADD THE NEW ENDPOINT ---
+# backend/main.py
+
+# Assuming necessary imports like BaseModel, Field, List, Optional, Dict, Any,
+# APIRouter, HTTPException, Depends, logger_api, GEMINI_API_KEY,
+# genai, DeadlineExceeded, GoogleAPICallError, json, etc. are present above
+
+# Assuming Pydantic models are defined correctly above:
+# class VizSuggestion(BaseModel): ...
+# class SuggestVizRequest(BaseModel): ...
+# class SuggestVizResponse(BaseModel): ...
+
+# Assuming bq_router = APIRouter(...) is defined
+
+@bq_router.post("/suggest-visualization", response_model=SuggestVizResponse)
+async def suggest_visualization(req: SuggestVizRequest):
+    """Suggests appropriate visualizations based on query results schema and context."""
+
+    if not GEMINI_API_KEY:
+        logger_api.warning("Visualization suggestion requested but Gemini API key not set.")
+        return SuggestVizResponse(suggestions=[], error="AI suggestion service not configured.")
+
+    if not req.schema_:
+        raise HTTPException(status_code=400, detail="Schema information is required for suggestions.")
+
+    logger_api.info(f"Received visualization suggestion request. Query: {req.query_sql[:50] if req.query_sql else 'N/A'}, Prompt: {req.prompt[:50] if req.prompt else 'N/A'}")
+
+    try:  # Outer try starts here
+        # Prepare schema string for the prompt
+        schema_desc = "\n".join([f"- Column '{s.get('name', 'Unknown')}' (Type: {s.get('type', '?')})" for s in req.schema_])
+
+        # Prepare sample string
+        sample_str = ""
+        if req.result_sample:
+            try:
+                sample_str = "\nResult Sample (first few rows):\n"
+                if isinstance(req.result_sample, list) and len(req.result_sample) > 0 and isinstance(req.result_sample[0], dict):
+                    headers = list(req.result_sample[0].keys())
+                    sample_str += "| " + " | ".join(headers) + " |\n"
+                    sample_str += "|-" + "-|-".join(['-' * len(h) for h in headers]) + "-|\n"
+                    for row in req.result_sample:
+                        # Ensure values are strings before joining
+                        values = [str(row.get(h, '')) for h in headers] # Calculate values list
+                        sample_str += f"| {' | '.join(values)} |\n" # Join AFTER converting
+                else:
+                    sample_str += "(Sample not available or in unexpected format)\n"
+
+            except Exception as e_sample:
+                logger_api.warning(f"Could not format result sample for prompt: {e_sample}")
+                sample_str = "\n(Could not process sample data)\n"
+        # --- END OF SAMPLE STRING BLOCK ---
+
+
+        # --- CORRECTED: Construct context parts separately to avoid f-string backslash error ---
+        prompt_info = f"The query was generated from the natural language prompt: '{req.prompt}'" if req.prompt else ""
+        # Ensure newline after the closing backticks for clarity
+        sql_query_info = f"The SQL query executed was: ```sql\n{req.query_sql}\n```" if req.query_sql else ""
+        # --- END OF CORRECTION ---
+
+
+        prompt_context = f"""
+        A user ran a BigQuery query resulting in the following data schema:
+        {schema_desc}
+
+        {prompt_info}
+        {sql_query_info}
+        {sample_str}
+
+        Analyze the schema, query context (if provided), and sample data. Suggest suitable chart types for visualization.
+        For each suggestion, provide:
+        1.  `chart_type`: Choose ONE from "bar", "line", "pie", "scatter".
+        2.  `x_axis_column`: The EXACT column name from the schema to use for the X-axis (or categories for pie).
+        3.  `y_axis_columns`: A list containing ONE or MORE EXACT column names from the schema for the Y-axis (or values for pie/scatter). Use only numeric columns for Y-axis values (e.g., INTEGER, FLOAT, NUMERIC).
+        4.  `rationale`: A SHORT explanation (max 1-2 sentences) why this chart is suitable.
+
+        Output ONLY a valid JSON object containing a single key "suggestions" which is a list of suggestion objects (with keys chart_type, x_axis_column, y_axis_columns, rationale). Do not include any other text, explanations, or markdown.
+
+        Example JSON Output:
+        {{
+          "suggestions": [
+            {{
+              "chart_type": "bar",
+              "x_axis_column": "product_category",
+              "y_axis_columns": ["total_sales"],
+              "rationale": "Compare sales across different product categories."
+            }},
+            {{
+               "chart_type": "line",
+               "x_axis_column": "order_date",
+              "y_axis_columns": ["revenue", "profit"],
+               "rationale": "Track revenue and profit trends over time."
+            }}
+          ]
+        }}
+        """ # <-- This is the end of the f-string block, error likely pointed near here
+        logger_api.debug(f"Gemini Viz Suggestion Prompt:\n{prompt_context[:500]}...")
+
+        model = genai.GenerativeModel(
+             'gemini-1.5-flash-latest',
+             generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json", # Explicitly request JSON
+                temperature=0.2
+            )
+         )
+        response = await model.generate_content_async(
+             prompt_context,
+             # Set a reasonable timeout, maybe shorter than regular queries
+            request_options={'timeout': int(os.getenv("GEMINI_TIMEOUT_SECONDS", 120)) // 2}
+         )
+
+        logger_api.debug(f"Gemini Raw Viz Suggestion Response Text: {response.text}")
+
+        # Inner try block for JSON parsing
+        import json # Ensure json is imported
+        try:
+            # Clean potential markdown ```json ... ``` artifacts if the model doesn't strictly adhere
+            cleaned_response = response.text.strip()
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[len("```json"):].strip()
+            if cleaned_response.endswith("```"):
+                cleaned_response = cleaned_response[:-len("```")].strip()
+
+            # Check for empty response after cleaning
+            if not cleaned_response:
+                 logger_api.warning("Gemini returned an empty string after cleaning.")
+                 return SuggestVizResponse(suggestions=[], error="AI returned an empty response.")
+
+            suggestions_data = json.loads(cleaned_response)
+
+            # Validate the received structure
+            if isinstance(suggestions_data, dict) and 'suggestions' in suggestions_data and isinstance(suggestions_data['suggestions'], list):
+                validated_suggestions = []
+                schema_column_names = {s.get('name') for s in req.schema_ if s.get('name')} # Get valid column names
+
+                for sugg_raw in suggestions_data['suggestions']:
+                    # Validate individual suggestion structure and types
+                    if isinstance(sugg_raw, dict) and \
+                       all(k in sugg_raw for k in ['chart_type', 'x_axis_column', 'y_axis_columns', 'rationale']) and \
+                       isinstance(sugg_raw['y_axis_columns'], list) and \
+                       isinstance(sugg_raw['x_axis_column'], str) and \
+                       sugg_raw['x_axis_column'] in schema_column_names and \
+                       all(isinstance(yc, str) and yc in schema_column_names for yc in sugg_raw['y_axis_columns']) and \
+                       len(sugg_raw['y_axis_columns']) > 0:
+                         # Optional: Further validation on chart_type enum?
+
+                         validated_suggestions.append(VizSuggestion(
+                            chart_type=sugg_raw['chart_type'],
+                            x_axis_column=sugg_raw['x_axis_column'],
+                            y_axis_columns=sugg_raw['y_axis_columns'],
+                            rationale=sugg_raw.get('rationale', 'AI Suggestion.') # Provide default rationale
+                         ))
+                    else:
+                         logger_api.warning(f"Skipping invalid or incomplete suggestion format from AI: {sugg_raw}")
+
+                logger_api.info(f"Gemini generated {len(validated_suggestions)} valid visualization suggestions.")
+                return SuggestVizResponse(suggestions=validated_suggestions)
+            else:
+                logger_api.error(f"Gemini response JSON root structure is invalid: {suggestions_data}")
+                return SuggestVizResponse(suggestions=[], error="AI returned suggestions in an unexpected format.")
+
+        except json.JSONDecodeError as json_err:
+             logger_api.error(f"Failed to parse JSON response from Gemini: {json_err}\nResponse Text: {response.text}")
+             return SuggestVizResponse(suggestions=[], error="AI response was not valid JSON.")
+        except Exception as e_parse: # Catch validation or Pydantic errors
+             logger_api.error(f"Error processing Gemini suggestions: {e_parse}", exc_info=True)
+             return SuggestVizResponse(suggestions=[], error=f"Error processing AI suggestions: {str(e_parse)}")
+
+    # --- Outer try block exceptions ---
+    except DeadlineExceeded:
+        logger_api.error("Gemini API call for suggestions timed out.")
+        raise HTTPException(status_code=504, detail="AI suggestion generation timed out.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Gemini API call error for suggestions: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Error communicating with AI service for suggestions: {str(e)}")
+    except Exception as e: # Generic catch for the outer try
+        logger_api.error(f"Unexpected error during visualization suggestion generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate suggestions: {str(e)}")
+
+# --- Make sure you include the router in your main app ---
+# Example: app.include_router(bq_router) should be present somewhere
+
+
+# --- Include Routers ---
+app.include_router(bq_router)
 
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
