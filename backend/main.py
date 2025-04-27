@@ -15,13 +15,14 @@ from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse # Keep if used later
 from pydantic import BaseModel, Field
-
+import json
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
 from google.cloud.exceptions import NotFound, BadRequest
 from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
+from routers.export import export_router
 
 # Utilities
 from dotenv import load_dotenv
@@ -116,6 +117,19 @@ class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
 class SchemaResponse(BaseModel): dataset_id: str; tables: List[TableSchema]
 class NLQueryRequest(BaseModel): prompt: str = Field(...); dataset_id: str = Field(...)
 class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Optional[str] = None
+
+
+
+class AISummaryRequest(BaseModel):
+    schema_: List[Dict[str, Any]] = Field(..., alias="schema")
+    query_sql: str
+    original_prompt: Optional[str] = None # The user's natural language question, if available
+    result_sample: List[Dict[str, Any]]
+
+class AISummaryResponse(BaseModel):
+    summary_text: Optional[str] = None
+    error: Optional[str] = None
+
 
 # --- Helper Functions ---
 def serialize_bq_row(row: bigquery.table.Row) -> Dict[str, Any]:
@@ -432,19 +446,104 @@ class SuggestVizResponse(BaseModel):
     suggestions: List[VizSuggestion]
     error: Optional[str] = None
 
-# --- ADD THE NEW ENDPOINT ---
-# backend/main.py
+# +++ NEW ENDPOINT: /summarize-results +++
+@bq_router.post("/summarize-results", response_model=AISummaryResponse)
+async def summarize_results(req: AISummaryRequest):
+    """Generates a natural language summary of query results using Gemini."""
+    if not GEMINI_API_KEY:
+        logger_api.warning("AI Summary requested but Gemini API key not set.")
+        return AISummaryResponse(error="AI summary service not configured.")
 
-# Assuming necessary imports like BaseModel, Field, List, Optional, Dict, Any,
-# APIRouter, HTTPException, Depends, logger_api, GEMINI_API_KEY,
-# genai, DeadlineExceeded, GoogleAPICallError, json, etc. are present above
+    if not req.schema_:
+        raise HTTPException(status_code=400, detail="Schema information is required for summary.")
+    if not req.result_sample:
+         raise HTTPException(status_code=400, detail="Result sample is required for summary.")
+    if not req.query_sql:
+         raise HTTPException(status_code=400, detail="SQL query is required for context.")
 
-# Assuming Pydantic models are defined correctly above:
-# class VizSuggestion(BaseModel): ...
-# class SuggestVizRequest(BaseModel): ...
-# class SuggestVizResponse(BaseModel): ...
+    logger_api.info(f"Received AI summary request. SQL: {req.query_sql[:50]}..., Prompt: {req.original_prompt[:50] if req.original_prompt else 'N/A'}")
 
-# Assuming bq_router = APIRouter(...) is defined
+    try:
+        # Prepare schema string
+        schema_desc = "\n".join([f"- Column '{s.get('name', 'Unknown')}' (Type: {s.get('type', '?')}, Mode: {s.get('mode', 'NULLABLE')})" for s in req.schema_])
+
+        # Prepare sample string (limited rows for prompt length)
+        sample_str = ""
+        # Limit sample size further if needed, e.g., max 10 rows, 500 chars total?
+        MAX_SAMPLE_ROWS_FOR_SUMMARY = 10
+        sample_to_send = req.result_sample[:MAX_SAMPLE_ROWS_FOR_SUMMARY]
+
+        if sample_to_send:
+            try:
+                # Use JSON representation for clarity in the prompt
+                sample_str = f"\nResult Sample (up to {MAX_SAMPLE_ROWS_FOR_SUMMARY} rows):\n```json\n"
+                sample_str += json.dumps(sample_to_send, indent=2, default=str) # Use default=str for non-serializable types
+                sample_str += "\n```\n"
+            except Exception as e_sample:
+                logger_api.warning(f"Could not format result sample as JSON for summary prompt: {e_sample}")
+                sample_str = "\n(Could not process sample data for prompt)\n"
+
+        # Construct context parts
+        prompt_context_str = f"The user executed the following SQL query:\n```sql\n{req.query_sql}\n```"
+        if req.original_prompt:
+            prompt_context_str += f"\n\nThis query was likely generated from the user's original request: \"{req.original_prompt}\""
+
+        # --- Define the Summary Prompt ---
+        summary_prompt = f"""You are a data analyst assistant. A user ran a query and obtained results. Your task is to provide a concise, insightful summary of the key findings based on the provided context and data sample.
+
+Context:
+{prompt_context_str}
+
+Result Schema:
+{schema_desc}
+
+{sample_str}
+
+Instructions:
+1.  **Analyze the Goal:** Consider the original user request (if provided) and the executed SQL query to understand what the user was trying to find.
+2.  **Interpret the Sample:** Examine the sample data rows. Identify key patterns, trends, maximums, minimums, or notable distributions relevant to the user's goal.
+3.  **Synthesize Findings:** Write a brief (2-4 sentences) natural language summary focusing on the most important insights derived from the data sample in relation to the query's purpose.
+4.  **Actionable Suggestions (Optional):** If appropriate, suggest 1-2 potential next steps or follow-up questions the user might consider based on the findings.
+5.  **Tone:** Be informative, objective, and helpful.
+6.  **Output:** Respond with ONLY the summary text. Do not include greetings, introductions, or markdown formatting like headings or bullet points unless it naturally fits within the summary paragraph. Start directly with the summary.
+
+Summary of Findings:
+"""
+        logger_api.debug(f"Gemini Summary Prompt:\n{summary_prompt[:600]}...") # Log beginning of prompt
+
+        # --- Call Gemini API ---
+        model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or another suitable model
+        response = await model.generate_content_async(
+             summary_prompt,
+             # Use a moderate temperature for informative summary
+             generation_config=genai.types.GenerationConfig(temperature=0.4),
+             # Timeout might need adjustment depending on complexity
+             request_options={'timeout': GEMINI_REQUEST_TIMEOUT}
+         )
+
+        # --- Process Response ---
+        logger_api.debug(f"Gemini Raw Summary Response: {response.text}")
+        generated_summary = response.text.strip() if hasattr(response, 'text') else ""
+
+        if not generated_summary:
+             logger_api.warning("Gemini returned an empty summary.")
+             return AISummaryResponse(error="AI failed to generate a summary.")
+
+        logger_api.info(f"AI Summary generated successfully: {generated_summary[:100]}...")
+        return AISummaryResponse(summary_text=generated_summary)
+
+    # --- Error Handling ---
+    except DeadlineExceeded:
+        logger_api.error("Gemini API call for summary timed out.")
+        raise HTTPException(status_code=504, detail="AI summary generation timed out.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Gemini API call error for summary: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Error communicating with AI service for summary: {str(e)}")
+    except Exception as e: # Generic catch for unexpected issues
+        logger_api.error(f"Unexpected error during AI summary generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate AI summary: {str(e)}")
+# +++ END NEW ENDPOINT +++
+
 
 @bq_router.post("/suggest-visualization", response_model=SuggestVizResponse)
 async def suggest_visualization(req: SuggestVizRequest):
@@ -617,7 +716,7 @@ async def suggest_visualization(req: SuggestVizRequest):
 # --- Include Routers ---
 app.include_router(bq_router)
 app.include_router(chat_router)
-
+app.include_router(export_router) 
 
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
