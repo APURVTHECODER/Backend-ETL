@@ -8,7 +8,7 @@ from datetime import timedelta, timezone, datetime, date, time # Added date, tim
 from typing import List, Dict, Any, Optional
 import traceback
 import uuid
-
+from routers.chatbot import chat_router
 from auth import get_current_user, verify_token
 # FastAPI and Pydantic
 from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path
@@ -616,6 +616,8 @@ async def suggest_visualization(req: SuggestVizRequest):
 
 # --- Include Routers ---
 app.include_router(bq_router)
+app.include_router(chat_router)
+
 
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
