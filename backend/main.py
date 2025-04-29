@@ -105,8 +105,17 @@ logger_api.info(f"CORS enabled for origins: {allowed_origins}")
 
 # --- Pydantic Models ---
 class TableListItem(BaseModel): tableId: str
-class QueryRequest(BaseModel): sql: str; default_dataset: Optional[str] = None; max_bytes_billed: Optional[int] = None; use_legacy_sql: bool = False; priority: str = "INTERACTIVE"
-class JobSubmitResponse(BaseModel): job_id: str; state: str; location: str; message: str = "Job submitted successfully."
+class QueryRequest(BaseModel):
+    sql: str
+    priority: str = Field(default="BATCH", pattern="^(BATCH|INTERACTIVE)$") # Example validation
+    use_legacy_sql: bool = False
+    default_dataset: str | None = None # Expecting "project.dataset" format
+    max_bytes_billed: int | None = None
+    location: str | None = None # Make location optional if client might not always know it
+class JobSubmitResponse(BaseModel):
+    job_id: str
+    state: str
+    location: str | None # Location might not always be present immediately
 class JobStatusResponse(BaseModel): job_id: str; state: str; location: str; statement_type: Optional[str] = None; error_result: Optional[Dict[str, Any]] = None; user_email: Optional[str] = None; creation_time: Optional[datetime] = None; start_time: Optional[datetime] = None; end_time: Optional[datetime] = None; total_bytes_processed: Optional[int] = None; num_dml_affected_rows: Optional[int] = None
 class JobResultsResponse(BaseModel): rows: List[Dict[str, Any]]; total_rows_in_result_set: Optional[int] = None; next_page_token: Optional[str] = None; schema_: Optional[List[Dict[str, Any]]] = Field(None, alias="schema")
 class TableStatsModel(BaseModel): rowCount: Optional[int] = None; sizeBytes: Optional[int] = None; lastModified: Optional[str] = None
@@ -126,6 +135,7 @@ class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Op
 
 class DatasetListItemModel(BaseModel):
     datasetId: str
+    location: str
     # You could add other fields like location, project if needed
 
 class DatasetListResponse(BaseModel):
@@ -334,12 +344,16 @@ async def submit_bigquery_job(req: QueryRequest):
         except ValueError: raise HTTPException(400, "Invalid format for default_dataset. Use 'project.dataset'.")
     if req.max_bytes_billed is not None: job_config.maximum_bytes_billed = req.max_bytes_billed
     try:
-        query_job = api_bigquery_client.query(req.sql, job_config=job_config, location=DEFAULT_BQ_LOCATION)
+        query_job = api_bigquery_client.query(req.sql, job_config=job_config, location=req.location)
         logger_api.info(f"BigQuery Job Submitted. Job ID: {query_job.job_id}, Location: {query_job.location}, Initial State: {query_job.state}")
         return JobSubmitResponse(job_id=query_job.job_id, state=query_job.state, location=query_job.location)
     except BadRequest as e: logger_api.error(f"Invalid Query Syntax or Configuration: {e}", exc_info=False); raise HTTPException(400, f"Invalid query or configuration: {str(e)}")
     except GoogleAPICallError as e: logger_api.error(f"Google API Call Error during job submission: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
     except Exception as e: logger_api.error(f"Unexpected error submitting job: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+
+
+
+
 
 @bq_router.get("/tables", response_model=List[TableListItem])
 async def list_bigquery_tables(dataset_id: str = Query(..., description="Full dataset ID")):
@@ -780,15 +794,23 @@ async def list_bigquery_datasets(
     datasets_list: List[DatasetListItemModel] = []
     try:
         # list_datasets returns an iterator of google.cloud.bigquery.DatasetListItem
-        datasets_iterator = api_bigquery_client.list_datasets(project=API_GCP_PROJECT)
+        datasets_list: List[DatasetListItemModel] = []
 
-        for dataset_item in datasets_iterator:
+        for dataset_item in api_bigquery_client.list_datasets(project=API_GCP_PROJECT):
             # Extract the dataset ID
-            ds_id = dataset_item.dataset_id
+            ds_ref: DatasetReference = dataset_item.reference
+
+            # Fetch full metadata (this is where location lives)
+            ds = api_bigquery_client.get_dataset(ds_ref)
             # Optional: Add filtering logic here if needed based on labels, etc.
             # if filter_label and filter_label not in (dataset_item.labels or {}):
             #     continue
-            datasets_list.append(DatasetListItemModel(datasetId=ds_id))
+            datasets_list.append(
+                DatasetListItemModel(
+                    datasetId=ds.dataset_id,
+                    location=ds.location
+                )
+            )
 
         logger_api.info(f"Found {len(datasets_list)} datasets.")
         return DatasetListResponse(datasets=datasets_list)
