@@ -99,6 +99,8 @@ async def get_current_user(token: HTTPAuthorizationCredentials = Depends(oauth2_
         raise credentials_exception
 
 # Optional: Dependency that just validates without returning user data
-async def verify_token(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)):
-    await get_current_user(token) # Call the main function, it will raise exception on failure
-    return True # Return simple boolean or nothing if just used in dependencies list
+async def verify_token(
+    token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)
+) -> Dict[str, Any]:
+    decoded = auth.verify_id_token(token.credentials, app=firebase_app, check_revoked=True)
+    return decoded
