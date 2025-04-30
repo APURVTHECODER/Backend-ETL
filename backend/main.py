@@ -5,7 +5,7 @@ import os
 import logging
 import re
 from datetime import timedelta, timezone, datetime, date, time # Added date, time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import traceback
 import uuid
 from routers.chatbot import chat_router
@@ -105,20 +105,41 @@ logger_api.info(f"CORS enabled for origins: {allowed_origins}")
 
 # --- Pydantic Models ---
 class TableListItem(BaseModel): tableId: str
-class QueryRequest(BaseModel): sql: str; default_dataset: Optional[str] = None; max_bytes_billed: Optional[int] = None; use_legacy_sql: bool = False; priority: str = "INTERACTIVE"
-class JobSubmitResponse(BaseModel): job_id: str; state: str; location: str; message: str = "Job submitted successfully."
+class QueryRequest(BaseModel):
+    sql: str
+    priority: str = Field(default="BATCH", pattern="^(BATCH|INTERACTIVE)$") # Example validation
+    use_legacy_sql: bool = False
+    default_dataset: str | None = None # Expecting "project.dataset" format
+    max_bytes_billed: int | None = None
+    location: str | None = None # Make location optional if client might not always know it
+class JobSubmitResponse(BaseModel):
+    job_id: str
+    state: str
+    location: str | None # Location might not always be present immediately
 class JobStatusResponse(BaseModel): job_id: str; state: str; location: str; statement_type: Optional[str] = None; error_result: Optional[Dict[str, Any]] = None; user_email: Optional[str] = None; creation_time: Optional[datetime] = None; start_time: Optional[datetime] = None; end_time: Optional[datetime] = None; total_bytes_processed: Optional[int] = None; num_dml_affected_rows: Optional[int] = None
 class JobResultsResponse(BaseModel): rows: List[Dict[str, Any]]; total_rows_in_result_set: Optional[int] = None; next_page_token: Optional[str] = None; schema_: Optional[List[Dict[str, Any]]] = Field(None, alias="schema")
 class TableStatsModel(BaseModel): rowCount: Optional[int] = None; sizeBytes: Optional[int] = None; lastModified: Optional[str] = None
 class TableDataResponse(BaseModel): rows: List[Dict[str, Any]]; totalRows: Optional[int] = None; stats: Optional[TableStatsModel] = None
-class ETLRequest(BaseModel): object_name: str
+class ETLRequest(BaseModel):
+    object_name: str = Field(..., description="Full GCS path of the uploaded object (e.g., dataset_prefix/filename.xlsx)")
+    target_dataset_id: str = Field(..., description="The BigQuery dataset ID to load the data into (e.g., my_team_dataset)")
+# +++ MODIFICATION END +++
 class ColumnInfo(BaseModel): name: str; type: str; mode: str
 class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
 class SchemaResponse(BaseModel): dataset_id: str; tables: List[TableSchema]
-class NLQueryRequest(BaseModel): prompt: str = Field(...); dataset_id: str = Field(...)
+class NLQueryRequest(BaseModel):
+    prompt: str = Field(...)
+    dataset_id: str = Field(..., description="The BigQuery dataset ID to query against.")
+    table_prefix: Optional[str] = Field(None, description="Optional prefix to filter tables shown to the AI (e.g., 'sales_').") # Added for context filtering
 class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Optional[str] = None
 
+class DatasetListItemModel(BaseModel):
+    datasetId: str
+    location: str
+    # You could add other fields like location, project if needed
 
+class DatasetListResponse(BaseModel):
+    datasets: List[DatasetListItemModel]
 
 class AISummaryRequest(BaseModel):
     schema_: List[Dict[str, Any]] = Field(..., alias="schema")
@@ -207,24 +228,45 @@ async def get_bigquery_dataset_schema(
         logger_api.error(f"Unexpected error in get_dataset_schema endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve schema: {str(e)}")
 
-# --- MODIFIED nl2sql Endpoint ---
 @bq_router.post("/nl2sql", response_model=NLQueryResponse)
-async def natural_language_to_sql(req: NLQueryRequest):
-    """Converts a natural language prompt into a BigQuery SQL query using Gemini."""
+async def natural_language_to_sql(req: NLQueryRequest): # Accepts the modified request model
+    """Converts a natural language prompt into a BigQuery SQL query using Gemini, potentially filtered by table prefix."""
     if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
     if not GEMINI_API_KEY: raise HTTPException(503, "NL-to-SQL service not configured.")
     if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt cannot be empty.")
 
-    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prompt: {req.prompt[:100]}...")
+    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prefix: '{req.table_prefix or 'None'}'. Prompt: {req.prompt[:100]}...")
 
     try:
-        table_schemas = get_dataset_schema(req.dataset_id)
-        if not table_schemas: raise HTTPException(404, f"No tables/schema found for dataset {req.dataset_id}.")
+        # 1. Fetch the *full* schema for the dataset first
+        all_table_schemas = get_dataset_schema(req.dataset_id)
+        if not all_table_schemas:
+             raise HTTPException(404, f"No tables/schema found for dataset {req.dataset_id}.")
 
-        schema_string = "\n".join([f"Table: {ts.table_id} (Columns: {', '.join([f'{c.name} {c.type}' for c in ts.columns])})" for ts in table_schemas])
+        # 2. Filter the schema based on the provided prefix (if any)
+        filtered_table_schemas = all_table_schemas
+        if req.table_prefix and req.table_prefix.strip():
+            prefix = req.table_prefix.strip()
+            filtered_table_schemas = [
+                ts for ts in all_table_schemas if ts.table_id.startswith(prefix)
+            ]
+            logger_api.info(f"Filtered schema from {len(all_table_schemas)} to {len(filtered_table_schemas)} tables using prefix '{prefix}'.")
+            if not filtered_table_schemas:
+                 # It's possible the prefix filters out everything
+                 raise HTTPException(404, f"No tables found in dataset {req.dataset_id} matching prefix '{prefix}'.")
+        else:
+             logger_api.info(f"No table prefix provided or empty, using schema for all {len(all_table_schemas)} tables.")
+
+
+        # 3. Build the schema string *from the filtered list*
+        schema_string = "\n".join([
+            f"Table: {ts.table_id} (Columns: {', '.join([f'{c.name} {c.type}' for c in ts.columns])})"
+            for ts in filtered_table_schemas # Use the filtered list here
+        ])
         full_dataset_id_str = f"{API_GCP_PROJECT}.{req.dataset_id}" # For use in table names
 
-        prompt_template = f"""You are an expert BigQuery SQL generator. Generate a *single*, valid, executable BigQuery SQL query based on the user request and database schema.
+        # 4. Construct the AI Prompt (using the potentially filtered schema)
+        prompt_template = f"""You are an expert BigQuery SQL generator. Generate a *single*, valid, executable BigQuery SQL query based on the user request and the provided database schema subset.
 
 Database Schema (Dataset ID: {req.dataset_id}, Project ID: {API_GCP_PROJECT}):
 {schema_string}
@@ -233,7 +275,7 @@ User Request: "{req.prompt}"
 
 Instructions:
 1.  **Query Type:** Generate ONLY a valid BigQuery `SELECT` query. Do not generate DML or DDL.
-2.  **Table/Column Mapping (CRITICAL):** Analyze the User Request carefully for mentions of table or column concepts. Map approximate mentions (e.g., "approval deck", "payment amount") to the *exact* schema names provided (e.g., "APPROVAL_DECK", "Amount"). Consider variations in casing, spacing, and underscores. If ambiguous, use context.
+2.  **Table/Column Mapping (CRITICAL):** Analyze the User Request carefully for mentions of table or column concepts. Map approximate mentions (e.g., "approval deck", "payment amount") to the *exact* schema names provided (e.g., "APPROVAL_DECK", "Amount"). Consider variations in casing, spacing, and underscores. If ambiguous, use context. ONLY use tables and columns listed in the schema above.
 3.  **Table Qualification:** ALWAYS fully qualify table names as `{full_dataset_id_str}`.`YourTableName`. Use backticks `` ` `` around the fully qualified name: `{full_dataset_id_str}.\`YourTableName\``.
 4.  **Column Qualification:** Use table aliases and qualify column names (e.g., `t1.colA`) if joining multiple tables.
 5.  **Syntax:** Use correct BigQuery Standard SQL. Use backticks `` ` `` around table and column names ONLY if they contain special characters or are reserved keywords. Prefer schema names directly if valid.
@@ -242,8 +284,9 @@ Instructions:
 
 Generated BigQuery SQL Query:
 """
-        logger_api.debug(f"Gemini Prompt (Enhanced v2):\n{prompt_template}")
+        logger_api.debug(f"Gemini Prompt (Filtered Schema: {'Yes' if req.table_prefix else 'No'}):\n{prompt_template}")
 
+        # 5. Call Gemini API (Unchanged)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         response = await model.generate_content_async(
              prompt_template,
@@ -251,6 +294,7 @@ Generated BigQuery SQL Query:
              request_options={'timeout': GEMINI_REQUEST_TIMEOUT}
         )
 
+        # 6. Process Response (Unchanged)
         logger_api.debug(f"Gemini Raw Response Candidates: {response.candidates}")
         generated_sql = ""
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
@@ -274,16 +318,17 @@ Generated BigQuery SQL Query:
              return NLQueryResponse(error=f"AI could not generate query: {generated_sql.strip('-- ')}")
         if not generated_sql.lower().lstrip().startswith("select"):
              logger_api.warning(f"Generated text does not start with SELECT: {generated_sql[:100]}...")
-             # Returning potentially non-SELECT query for now
+             # Consider returning an error if strict SELECT is required
              # return NLQueryResponse(error=f"AI did not generate a valid SELECT query. Output: {generated_sql[:100]}...")
 
-        logger_api.info(f"NL-to-SQL successful. Generated SQL: {generated_sql[:100]}...")
+        logger_api.info(f"NL-to-SQL successful (Filtered Schema: {'Yes' if req.table_prefix else 'No'}). Generated SQL: {generated_sql[:100]}...")
         return NLQueryResponse(generated_sql=generated_sql)
 
+    except HTTPException as http_exc: # Re-raise user-facing errors (like 404s from filtering)
+         raise http_exc
     except DeadlineExceeded: logger_api.error("Gemini API call timed out."); raise HTTPException(504, "NL-to-SQL generation timed out.")
     except GoogleAPICallError as e: logger_api.error(f"Gemini API call error: {e}"); raise HTTPException(502, f"Error communicating with AI service: {str(e)}")
     except Exception as e: logger_api.error(f"Error during NL-to-SQL generation: {e}", exc_info=True); raise HTTPException(500, f"Failed to generate SQL: {str(e)}")
-# --- END MODIFICATION ---
 
 
 # --- Other Endpoints ---
@@ -299,12 +344,16 @@ async def submit_bigquery_job(req: QueryRequest):
         except ValueError: raise HTTPException(400, "Invalid format for default_dataset. Use 'project.dataset'.")
     if req.max_bytes_billed is not None: job_config.maximum_bytes_billed = req.max_bytes_billed
     try:
-        query_job = api_bigquery_client.query(req.sql, job_config=job_config, location=DEFAULT_BQ_LOCATION)
+        query_job = api_bigquery_client.query(req.sql, job_config=job_config, location=req.location)
         logger_api.info(f"BigQuery Job Submitted. Job ID: {query_job.job_id}, Location: {query_job.location}, Initial State: {query_job.state}")
         return JobSubmitResponse(job_id=query_job.job_id, state=query_job.state, location=query_job.location)
     except BadRequest as e: logger_api.error(f"Invalid Query Syntax or Configuration: {e}", exc_info=False); raise HTTPException(400, f"Invalid query or configuration: {str(e)}")
     except GoogleAPICallError as e: logger_api.error(f"Google API Call Error during job submission: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
     except Exception as e: logger_api.error(f"Unexpected error submitting job: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+
+
+
+
 
 @bq_router.get("/tables", response_model=List[TableListItem])
 async def list_bigquery_tables(dataset_id: str = Query(..., description="Full dataset ID")):
@@ -370,30 +419,49 @@ async def get_bigquery_job_results(job_id: str = Path(...), location: str = Quer
 
 # --- Upload/ETL Endpoints ---
 @app.get("/api/upload-url", tags=["Upload"], dependencies=[Depends(verify_token)])
-async def get_upload_url(filename: str = Query(..., description="Name of the file to upload.")):
+async def get_upload_url(
+    filename: str = Query(..., description="Name of the file to upload."),
+    dataset_id: str = Query(..., description="The target BigQuery dataset ID this upload belongs to (used for GCS prefix).") # Added dataset_id
+):
+    """Generates a GCS signed URL for uploading a file to a specific dataset's prefix."""
     if not api_storage_client: logger_api.error("Cannot generate upload URL: Storage client not available."); raise HTTPException(503, "Storage service unavailable")
     if not filename: raise HTTPException(400, "Filename parameter is required")
-    if not API_GCS_BUCKET: raise HTTPException(500, "GCS Bucket configuration missing on server.")
+    if not dataset_id: raise HTTPException(400, "dataset_id parameter is required") # Validate dataset_id
+    if not API_GCS_BUCKET: raise HTTPException(500, "GCS Bucket configuration missing on server.") # Check for the managed bucket
+
+    # Sanitize filename and dataset_id for path safety (basic example)
     clean_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
-    destination_blob_name = f"uploads/{clean_filename}"
-    logger_api.info(f"Generating signed URL for blob: {destination_blob_name} in bucket {API_GCS_BUCKET}")
+    # IMPORTANT: Implement proper sanitization/validation for dataset_id if it comes directly from user input
+    # For now, assume it's a valid BQ dataset ID format used as a prefix.
+    safe_dataset_prefix = re.sub(r"[^a-zA-Z0-9_]", "_", dataset_id) # Basic sanitization
+
+    # Construct the blob path using the dataset prefix
+    destination_blob_name = f"{safe_dataset_prefix}/{clean_filename}" # Path: dataset_id/fMilliame
+
+    logger_api.info(f"Generating signed URL for blob: {destination_blob_name} in MANAGED bucket {API_GCS_BUCKET} (Target Dataset: {dataset_id})")
     try:
         bucket = api_storage_client.bucket(API_GCS_BUCKET); blob = bucket.blob(destination_blob_name)
         url = blob.generate_signed_url(version="v4", expiration=timedelta(minutes=SIGNED_URL_EXPIRATION_MINUTES), method="PUT")
         logger_api.info(f"Signed URL generated successfully for {destination_blob_name}")
-        return {"url": url, "object_name": blob.name}
+        # Return the full object name (including prefix) and the target dataset
+        return {"url": url, "object_name": blob.name, "target_dataset_id": dataset_id}
     except NotFound: logger_api.error(f"GCS Bucket not found: {API_GCS_BUCKET}"); raise HTTPException(404, f"GCS Bucket '{API_GCS_BUCKET}' not found.")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
-    except Exception as e: logger_api.error(f"Error generating signed URL for {filename}: {e}", exc_info=True); raise HTTPException(500, f"Could not generate upload URL: {str(e)}")
+    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename} (dataset: {dataset_id}): {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
 
 @app.post("/api/trigger-etl", tags=["ETL"], dependencies=[Depends(verify_token)])
 async def trigger_etl(payload: ETLRequest, request: Request):
+    logger_api.info(f"[DEBUG] /api/trigger-etl received payload: {payload.dict()}")
     if not api_publisher or not api_topic_path: logger_api.error("Cannot trigger ETL: Publisher client not available."); raise HTTPException(503, "Messaging service unavailable")
-    if not payload.object_name or not payload.object_name.startswith("uploads/"): logger_api.warning(f"Invalid object_name received for ETL trigger: {payload.object_name}"); raise HTTPException(400, "Invalid object_name provided. Must start with 'uploads/'.")
+    #if not payload.object_name or not payload.object_name.startswith("uploads/"): logger_api.warning(f"Invalid object_name received for ETL trigger: {payload.object_name}"); raise HTTPException(400, "Invalid object_name provided. Must start with 'uploads/'.")
+    safe_dataset_prefix = re.sub(r"[^a-zA-Z0-9_]", "_", payload.target_dataset_id)
+    if not payload.object_name or not payload.target_dataset_id:
+         logger_api.warning(f"Invalid payload content for ETL trigger: object_name or target_dataset_id is empty/null. Payload: {payload.dict()}")
+         raise HTTPException(400, "Invalid payload content: object_name and target_dataset_id must not be empty.")
     client_ip = request.client.host if request.client else "unknown"
     logger_api.info(f"Triggering ETL for object: {payload.object_name} (requested by {client_ip})")
     try:
-        data = payload.object_name.encode("utf-8")
+        message_data = { "object_name": payload.object_name, "target_dataset_id": payload.target_dataset_id }
+        data = json.dumps(message_data).encode("utf-8") # Sends the JSON string encoded
         future = api_publisher.publish(api_topic_path, data=data)
         def pubsub_callback(f):
              try: message_id = f.result(); logger_api.info(f"Pub/Sub message published successfully for {payload.object_name}. Message ID: {message_id}")
@@ -711,7 +779,48 @@ async def suggest_visualization(req: SuggestVizRequest):
 
 # --- Make sure you include the router in your main app ---
 # Example: app.include_router(bq_router) should be present somewhere
+# --- New Endpoint to List Datasets ---
+@bq_router.get("/datasets", response_model=DatasetListResponse, tags=["BigQuery"])
+async def list_bigquery_datasets(
+    # Add any query parameters if needed later (e.g., filter by label)
+    # filter_label: Optional[str] = Query(None, description="Filter datasets by label (e.g., 'env:prod')")
+):
+    """Retrieves a list of BigQuery datasets accessible by the service account."""
+    if not api_bigquery_client:
+        logger_api.error("Cannot list datasets: BigQuery client not available.")
+        raise HTTPException(status_code=503, detail="BigQuery client not available.")
 
+    logger_api.info(f"Listing BigQuery datasets for project: {API_GCP_PROJECT}")
+    datasets_list: List[DatasetListItemModel] = []
+    try:
+        # list_datasets returns an iterator of google.cloud.bigquery.DatasetListItem
+        datasets_list: List[DatasetListItemModel] = []
+
+        for dataset_item in api_bigquery_client.list_datasets(project=API_GCP_PROJECT):
+            # Extract the dataset ID
+            ds_ref: DatasetReference = dataset_item.reference
+
+            # Fetch full metadata (this is where location lives)
+            ds = api_bigquery_client.get_dataset(ds_ref)
+            # Optional: Add filtering logic here if needed based on labels, etc.
+            # if filter_label and filter_label not in (dataset_item.labels or {}):
+            #     continue
+            datasets_list.append(
+                DatasetListItemModel(
+                    datasetId=ds.dataset_id,
+                    location=ds.location
+                )
+            )
+
+        logger_api.info(f"Found {len(datasets_list)} datasets.")
+        return DatasetListResponse(datasets=datasets_list)
+
+    except GoogleAPICallError as e:
+        logger_api.error(f"Google API Call Error listing datasets: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
+    except Exception as e:
+        logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
 
 # --- Include Routers ---
 app.include_router(bq_router)
