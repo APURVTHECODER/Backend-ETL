@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 import json
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
-from google.cloud.exceptions import NotFound, BadRequest
+from google.cloud.exceptions import NotFound, BadRequest , Conflict
 from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
@@ -132,6 +132,27 @@ class NLQueryRequest(BaseModel):
     dataset_id: str = Field(..., description="The BigQuery dataset ID to query against.")
     table_prefix: Optional[str] = Field(None, description="Optional prefix to filter tables shown to the AI (e.g., 'sales_').") # Added for context filtering
 class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Optional[str] = None
+
+
+# --- Pydantic Models ---
+# ... (keep existing models)
+
+class CreateDatasetRequest(BaseModel):
+    dataset_id: str = Field(..., description="The desired ID for the new dataset. Must be unique within the project. Follows BigQuery naming rules (alphanumeric + underscore).", min_length=1, max_length=1024, pattern=r"^[a-zA-Z0-9_]+$")
+    location: Optional[str] = Field(DEFAULT_BQ_LOCATION, description="The geographic location for the dataset (e.g., 'US', 'EU', 'asia-northeast1'). Defaults to server config.")
+    description: Optional[str] = Field(None, description="A user-friendly description for the dataset.")
+    labels: Optional[Dict[str, str]] = Field(None, description="Key-value labels to apply to the dataset.")
+    # Add other common options if needed, e.g.:
+    # default_table_expiration_ms: Optional[int] = None
+    # default_partition_expiration_ms: Optional[int] = None
+
+class DatasetCreatedResponse(BaseModel):
+    project_id: str
+    dataset_id: str
+    location: str
+    description: Optional[str] = None
+    labels: Optional[Dict[str, str]] = None
+    # Add other relevant fields returned by BQ API if needed
 
 class DatasetListItemModel(BaseModel):
     datasetId: str
@@ -821,6 +842,92 @@ async def list_bigquery_datasets(
     except Exception as e:
         logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
+    
+
+
+# --- BigQuery API Endpoints (using bq_router) ---
+
+# ... (keep existing GET /datasets endpoint) ...
+
+# +++ START NEW ENDPOINT: Create Dataset +++
+@bq_router.post(
+    "/datasets",
+    response_model=DatasetCreatedResponse,
+    status_code=201, # HTTP 201 Created
+    tags=["BigQuery"],
+    summary="Create a new BigQuery Dataset",
+    description="Creates a new BigQuery dataset within the configured project using the service account credentials."
+)
+async def create_bigquery_dataset(
+    req: CreateDatasetRequest,
+    # Optional: If you want to associate the dataset with the user creating it,
+    # you could get the user info here, though it might not be directly relevant
+    # for the BQ API call itself unless used in labels/description.
+    # current_user: dict = Depends(get_current_user)
+):
+    """
+    Creates a new BigQuery dataset.
+
+    - **dataset_id**: The unique identifier for the dataset (letters, numbers, underscores).
+    - **location**: The geographic location (defaults to server setting).
+    - **description**: Optional description text.
+    - **labels**: Optional key-value labels.
+    """
+    if not api_bigquery_client:
+        logger_api.error("Cannot create dataset: BigQuery client not available.")
+        raise HTTPException(status_code=503, detail="BigQuery service unavailable.")
+    if not API_GCP_PROJECT:
+        logger_api.error("Cannot create dataset: GCP_PROJECT not configured.")
+        raise HTTPException(status_code=500, detail="Server configuration error (missing project ID).")
+
+    logger_api.info(f"Received request to create dataset '{req.dataset_id}' in location '{req.location or DEFAULT_BQ_LOCATION}'")
+
+    try:
+        # Construct the DatasetReference
+        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, req.dataset_id)
+
+        # Construct the Dataset object with properties
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = req.location or DEFAULT_BQ_LOCATION # Use request or default
+        if req.description:
+            dataset.description = req.description
+        if req.labels:
+            dataset.labels = req.labels
+        # Set other properties from req if added to the model (e.g., dataset.default_table_expiration_ms = ...)
+
+        # Attempt to create the dataset
+        # Use exists_ok=False to ensure it fails if the dataset already exists (returns 409 Conflict)
+        created_dataset = api_bigquery_client.create_dataset(dataset, timeout=30, exists_ok=False)
+
+        logger_api.info(f"Successfully created dataset: {created_dataset.full_dataset_id}")
+
+        # Return details of the created dataset
+        return DatasetCreatedResponse(
+            project_id=created_dataset.project,
+            dataset_id=created_dataset.dataset_id,
+            location=created_dataset.location,
+            description=created_dataset.description,
+            labels=created_dataset.labels,
+        )
+
+    except BadRequest as e:
+        # Often indicates invalid characters or format in dataset_id, or invalid location
+        logger_api.warning(f"Bad request creating dataset '{req.dataset_id}': {e}", exc_info=False)
+        raise HTTPException(status_code=400, detail=f"Invalid request: {str(e)}")
+    except Conflict:
+        # google.api_core.exceptions.Conflict (409) is raised when exists_ok=False and dataset exists
+        logger_api.warning(f"Dataset '{req.dataset_id}' already exists in project '{API_GCP_PROJECT}'.")
+        raise HTTPException(status_code=409, detail=f"Dataset '{req.dataset_id}' already exists.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Google API Call Error creating dataset '{req.dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
+    except Exception as e:
+        logger_api.error(f"Unexpected error creating dataset '{req.dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {str(e)}")
+
+# +++ END NEW ENDPOINT: Create Dataset +++
+
+# ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
 
 # --- Include Routers ---
 app.include_router(bq_router)
