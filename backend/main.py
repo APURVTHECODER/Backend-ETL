@@ -11,18 +11,21 @@ import uuid
 from routers.chatbot import chat_router
 from auth import get_current_user, verify_token
 # FastAPI and Pydantic
-from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path
+from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path , status,Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse # Keep if used later
 from pydantic import BaseModel, Field
 import json
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
-from google.cloud.exceptions import NotFound, BadRequest
+from google.cloud.exceptions import NotFound, BadRequest , Conflict
 from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
+from services.firestore_service import initialize_firestore # Import initializer
+from dependencies.rbac import require_admin # Import RBAC dependency
+from routers.user_profile import user_profile_router # Import new router
 
 # Utilities
 from dotenv import load_dotenv
@@ -132,6 +135,29 @@ class NLQueryRequest(BaseModel):
     dataset_id: str = Field(..., description="The BigQuery dataset ID to query against.")
     table_prefix: Optional[str] = Field(None, description="Optional prefix to filter tables shown to the AI (e.g., 'sales_').") # Added for context filtering
 class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Optional[str] = None
+
+class UserProfileResponse(BaseModel):
+    user_id: str
+    role: str
+# --- Pydantic Models ---
+# ... (keep existing models)
+
+class CreateDatasetRequest(BaseModel):
+    dataset_id: str = Field(..., description="The desired ID for the new dataset. Must be unique within the project. Follows BigQuery naming rules (alphanumeric + underscore).", min_length=1, max_length=1024, pattern=r"^[a-zA-Z0-9_]+$")
+    location: Optional[str] = Field(DEFAULT_BQ_LOCATION, description="The geographic location for the dataset (e.g., 'US', 'EU', 'asia-northeast1'). Defaults to server config.")
+    description: Optional[str] = Field(None, description="A user-friendly description for the dataset.")
+    labels: Optional[Dict[str, str]] = Field(None, description="Key-value labels to apply to the dataset.")
+    # Add other common options if needed, e.g.:
+    # default_table_expiration_ms: Optional[int] = None
+    # default_partition_expiration_ms: Optional[int] = None
+
+class DatasetCreatedResponse(BaseModel):
+    project_id: str
+    dataset_id: str
+    location: str
+    description: Optional[str] = None
+    labels: Optional[Dict[str, str]] = None
+    # Add other relevant fields returned by BQ API if needed
 
 class DatasetListItemModel(BaseModel):
     datasetId: str
@@ -386,6 +412,10 @@ async def get_table_data(dataset_id: str = Query(..., description="Full dataset 
     except NotFound: logger_api.warning(f"Table not found during preview fetch: {full_table_id}"); raise HTTPException(404, f"Table not found: {full_table_id}")
     except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
     except Exception as e: logger_api.error(f"Unexpected error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred while fetching table preview: {str(e)}")
+
+@app.on_event("startup")
+def startup_event():
+    initialize_firestore()
 
 @bq_router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_bigquery_job_status(job_id: str = Path(...), location: str = Query(DEFAULT_BQ_LOCATION)):
@@ -821,12 +851,147 @@ async def list_bigquery_datasets(
     except Exception as e:
         logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
+    
+
+
+# --- BigQuery API Endpoints (using bq_router) ---
+
+# ... (keep existing GET /datasets endpoint) ...
+
+@bq_router.post(
+    "/datasets",
+    response_model=DatasetCreatedResponse,
+    status_code=status.HTTP_201_CREATED, # Use status module
+    tags=["BigQuery"],
+    summary="Create a new BigQuery Dataset (Admin Only)",
+    description="Creates a new BigQuery dataset. Requires administrator privileges.",
+    # +++ Apply the RBAC dependency +++
+    dependencies=[Depends(require_admin)]
+)
+async def create_bigquery_dataset(
+    req: CreateDatasetRequest,
+    # The 'user_data' is available if needed from require_admin, but often unused directly here
+    # user_data: dict = Depends(require_admin) # No need to declare again if in router deps
+):
+    """
+    Creates a new BigQuery dataset. (Admin Only)
+    Requires the requesting user to have the 'admin' role stored in Firestore.
+    """
+    if not api_bigquery_client:
+        logger_api.error("Cannot create dataset: BigQuery client not available.")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
+    if not API_GCP_PROJECT:
+        logger_api.error("Cannot create dataset: GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+
+    logger_api.info(f"Admin request received to create dataset '{req.dataset_id}' in location '{req.location or DEFAULT_BQ_LOCATION}'")
+
+    try:
+        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, req.dataset_id)
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = req.location or DEFAULT_BQ_LOCATION
+        if req.description: dataset.description = req.description
+        if req.labels: dataset.labels = req.labels
+
+        created_dataset = api_bigquery_client.create_dataset(dataset, timeout=30, exists_ok=False)
+        logger_api.info(f"Admin successfully created dataset: {created_dataset.full_dataset_id}")
+
+        return DatasetCreatedResponse(
+            project_id=created_dataset.project,
+            dataset_id=created_dataset.dataset_id,
+            location=created_dataset.location,
+            description=created_dataset.description,
+            labels=created_dataset.labels,
+        )
+    # Keep existing specific error handling
+    except BadRequest as e:
+        logger_api.warning(f"Bad request creating dataset '{req.dataset_id}': {e}", exc_info=False)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request: {str(e)}")
+    except Conflict: # Catch the specific Conflict exception
+        logger_api.warning(f"Dataset '{req.dataset_id}' already exists in project '{API_GCP_PROJECT}'.")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Dataset '{req.dataset_id}' already exists.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Google API Call Error creating dataset '{req.dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API: {str(e)}")
+    except Exception as e:
+        logger_api.error(f"Unexpected error creating dataset '{req.dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred: {str(e)}")
+
+
+@bq_router.delete(
+    "/datasets/{dataset_id}",
+    status_code=status.HTTP_204_NO_CONTENT, # Standard for successful DELETE
+    tags=["BigQuery"],
+    summary="Delete a BigQuery Dataset (Admin Only)",
+    description="Permanently deletes a BigQuery dataset and all its contents (tables, views). Requires administrator privileges.",
+    dependencies=[Depends(require_admin)], # Apply RBAC
+    responses={
+        204: {"description": "Dataset deleted successfully"},
+        403: {"description": "Permission denied: Admin role required"},
+        404: {"description": "Dataset not found"},
+        500: {"description": "Internal server error"},
+        502: {"description": "Error communicating with BigQuery API"},
+        503: {"description": "BigQuery service unavailable"}
+    }
+)
+async def delete_bigquery_dataset(
+    dataset_id: str = Path(..., description="The ID of the dataset to delete.", example="my_team_dataset_to_delete"),
+    admin_user: dict = Depends(require_admin) # Get admin user data for logging if needed
+):
+    """
+    Deletes an existing BigQuery dataset, including all tables within it.
+    Requires the requesting user to have the 'admin' role stored in Firestore.
+    """
+    admin_uid = admin_user.get("uid", "unknown_admin") # Get admin UID for logging
+    if not api_bigquery_client:
+        logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': BigQuery client not available.")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
+    if not API_GCP_PROJECT:
+        logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+
+    full_dataset_id = f"{API_GCP_PROJECT}.{dataset_id}"
+    logger_api.warning(f"ADMIN ACTION by UID {admin_uid}: Attempting to DELETE dataset: {full_dataset_id} and all its contents!")
+
+    try:
+        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, dataset_id)
+
+        # Delete the dataset.
+        # delete_contents=True: Deletes tables within the dataset. If False, deletion fails if dataset is not empty.
+        # not_found_ok=False: Raises NotFound exception if the dataset doesn't exist.
+        api_bigquery_client.delete_dataset(
+            dataset_ref, delete_contents=True, not_found_ok=False
+        )
+
+        logger_api.info(f"Admin {admin_uid}: Successfully deleted dataset: {full_dataset_id}")
+        # Return HTTP 204 No Content on success, no response body needed.
+        # Note: Returning Response(status_code=204) might be more explicit for some frameworks
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    except NotFound:
+        logger_api.warning(f"Admin {admin_uid}: Dataset not found during delete attempt: {full_dataset_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dataset '{dataset_id}' not found.")
+    except GoogleAPICallError as e:
+        # Catch specific BQ API errors (e.g., permission issues on the *service account*)
+        logger_api.error(f"Admin {admin_uid}: Google API Call Error deleting dataset '{full_dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API during deletion: {str(e)}")
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger_api.error(f"Admin {admin_uid}: Unexpected error deleting dataset '{full_dataset_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during deletion: {str(e)}")
+
+# +++ END NEW ENDPOINT: Delete Dataset +++
+
+
+# +++ END NEW ENDPOINT: Create Dataset +++
+
+# ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
 
 # --- Include Routers ---
 app.include_router(bq_router)
 app.include_router(chat_router)
 app.include_router(export_router) 
-
+app.include_router(user_profile_router) # +++ Include the new user profile router +++
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
