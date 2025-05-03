@@ -289,12 +289,12 @@ async def natural_language_to_sql(req: NLQueryRequest): # Accepts the modified r
             f"Table: {ts.table_id} (Columns: {', '.join([f'{c.name} {c.type}' for c in ts.columns])})"
             for ts in filtered_table_schemas # Use the filtered list here
         ])
-        full_dataset_id_str = f"{API_GCP_PROJECT}.{req.dataset_id}" # For use in table names
+        full_dataset_id_str = f"{req.dataset_id}" # For use in table names
 
         # 4. Construct the AI Prompt (using the potentially filtered schema)
         prompt_template = f"""You are an expert BigQuery SQL generator. Generate a *single*, valid, executable BigQuery SQL query based on the user request and the provided database schema subset.
 
-Database Schema (Dataset ID: {req.dataset_id}, Project ID: {API_GCP_PROJECT}):
+Database Schema (Dataset ID: {req.dataset_id}):
 {schema_string}
 
 User Request: "{req.prompt}"
