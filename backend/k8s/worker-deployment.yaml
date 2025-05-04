@@ -1,0 +1,53 @@
+# k8s/worker-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: worker
+        image: ${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${APP_REPO_NAME}/worker:${IMAGE_TAG}
+        command: ["python", "etl.py"]  # ✅ JSON-style array
+        env:
+          - name: GCP_PROJECT
+            value: "crafty-tracker-457215-g6"
+          - name: PUBSUB_TOPIC
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: pubsub.topic
+          - name: GCS_BUCKET
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: gcs.bucket
+          - name: BQ_DATASET
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: bq.dataset
+          - name: PUBSUB_SUBSCRIPTION
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: pubsub.subscription
+          - name: GOOGLE_APPLICATION_CREDENTIALS # Python code might read this var name
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # The k8s secret
+                key: google.creds.base64 # <-- Use the key holding the Base64 string (Optional, only if GAC secret exists)
+          - name: GEMINI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # Same k8s secret
+                key: gemini.api.key # Key holding the plain API key
