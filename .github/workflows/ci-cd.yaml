@@ -2,9 +2,9 @@ name: Backend CI/CD
 
 on:
   push:
-    branches: [ "*" ] # Trigger deployment only on pushes to main
+    branches: [ main ] # Trigger deployment only on pushes to main
   pull_request:
-    branches: [ "*" ] # Trigger tests on PRs to main
+    branches: [ main ] # Trigger tests on PRs to main
 # Define environment variables using GitHub Secrets
 # Note: Non-secret values could be hardcoded for better readability, but using secrets works.
 env:
