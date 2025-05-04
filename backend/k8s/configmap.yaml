@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  log.level: "INFO"
+  gcs.bucket: "mybucket78600"      # ← your real GCS bucket
+  pubsub.topic: "etl-trigger-topic"                    # ← your real Pub/Sub topic
+  bq.dataset: "sample78600"
+  pubsub.subscription: "etl-worker-sub"

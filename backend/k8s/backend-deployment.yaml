@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: backend
+        image: ${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${APP_REPO_NAME}/backend:${IMAGE_TAG}
+        ports:
+        - containerPort: 8000
+        env:
+          - name: PORT # Keep this if needed by your app/framework
+            value: "8000"
+          - name: GCP_PROJECT # Get project ID from workflow/envsubst
+            value: "${GCP_PROJECT_ID}" # Assuming envsubst replaces this
+
+          # --- CORRECTED: Get Base64 content from k8s secret ---
+          - name: FIREBASE_ADMIN_SDK_KEY_BASE64 # Python code reads this var name
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # The k8s secret
+                key: firebase.key.base64 # <-- Use the key holding the Base64 string
+
+          - name: GOOGLE_APPLICATION_CREDENTIALS # Python code might read this var name
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # The k8s secret
+                key: google.creds.base64 # <-- Use the key holding the Base64 string (Optional, only if GAC secret exists)
+
+          # --- Get other secrets from k8s secret ---
+          - name: GEMINI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # Same k8s secret
+                key: gemini.api.key # Key holding the plain API key
+
+          # Example: Add Database URL if needed and created in workflow
+          # - name: DATABASE_URL
+          #   valueFrom:
+          #     secretKeyRef:
+          #       name: app-secrets
+          #       key: database.url
+
+          # --- Get non-secret config from ConfigMap ---
+          - name: GCS_BUCKET
+            valueFrom:
+              configMapKeyRef:
+                name: app-config # The k8s ConfigMap created by the workflow
+                key: gcs.bucket # Key within the ConfigMap
+          - name: PUBSUB_TOPIC
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: pubsub.topic # Key within the ConfigMap
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3

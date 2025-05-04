@@ -3,6 +3,8 @@
 # ==============================================================================
 import os
 import logging
+import tempfile
+import atexit # To help clean up the temp file
 import re
 from datetime import timedelta, timezone, datetime, date, time # Added date, time
 from typing import List, Dict, Any, Optional, Union
@@ -11,6 +13,8 @@ import uuid
 from routers.chatbot import chat_router
 from auth import get_current_user, verify_token
 # FastAPI and Pydantic
+import base64
+from clients import initialize_google_clients, initialize_gemini, _cleanup_temp_cred_file_clients # +++ MODIFIED +++
 from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path , status,Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse # Keep if used later
@@ -26,7 +30,17 @@ from routers.export import export_router
 from services.firestore_service import initialize_firestore # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
-
+from config import ( # Import config VARIABLES
+    API_GCP_PROJECT, API_GCS_BUCKET, API_PUBSUB_TOPIC, API_CREDENTIALS_PATH,
+    DEFAULT_JOB_TIMEOUT_SECONDS, DEFAULT_BQ_LOCATION, SIGNED_URL_EXPIRATION_MINUTES,
+    GEMINI_REQUEST_TIMEOUT, GEMINI_API_KEY, ALLOWED_ORIGINS
+)
+from dependencies.client_deps import (
+    get_bigquery_client,
+    get_storage_client,
+    get_pubsub_publisher,
+    get_pubsub_topic_path
+)
 # Utilities
 from dotenv import load_dotenv
 import pandas as pd
@@ -49,59 +63,23 @@ logger_api = logging.getLogger("uvicorn.error" if "uvicorn" in os.getenv("SERVER
 logger_api.setLevel(log_level)
 logger_api.info("FastAPI application starting...")
 
-# --- Configuration ---
-API_GCP_PROJECT = os.getenv("GCP_PROJECT")
-API_GCS_BUCKET = os.getenv("GCS_BUCKET")
-API_PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC")
-API_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-DEFAULT_JOB_TIMEOUT_SECONDS = int(os.getenv("BQ_JOB_TIMEOUT_SECONDS", 300))
-DEFAULT_BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
-SIGNED_URL_EXPIRATION_MINUTES = int(os.getenv("SIGNED_URL_EXPIRATION_MINUTES", 30))
-GEMINI_REQUEST_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT_SECONDS", 120)) # Ensure this is defined
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FIREBASE_ADMIN_SDK_KEY_PATH = os.getenv("FIREBASE_ADMIN_SDK_KEY_PATH")
-# --- Input Validation ---
-if not API_GCP_PROJECT: logger_api.critical("API Error: Missing required environment variable GCP_PROJECT")
-if not API_GCS_BUCKET: logger_api.warning("API Warning: GCS_BUCKET not set. Upload URL endpoint will fail.")
-if not API_PUBSUB_TOPIC: logger_api.warning("API Warning: PUBSUB_TOPIC not set. ETL trigger endpoint will fail.")
-if API_CREDENTIALS_PATH and not os.path.exists(API_CREDENTIALS_PATH): logger_api.warning(f"API Warning: Credentials file not found at: {API_CREDENTIALS_PATH}. Attempting ADC.")
-if not GEMINI_API_KEY: logger_api.warning("API Warning: GEMINI_API_KEY not set. NL-to-SQL endpoint will fail.")
 
-# --- Initialize API Clients ---
-api_bigquery_client: Optional[bigquery.Client] = None
-api_storage_client: Optional[storage.Client] = None
-api_publisher: Optional[pubsub_v1.PublisherClient] = None
-api_topic_path: Optional[str] = None
-if GEMINI_API_KEY:
-    try: genai.configure(api_key=GEMINI_API_KEY); logger_api.info("Gemini API configured successfully.")
-    except Exception as e_gemini_config: logger_api.error(f"Failed to configure Gemini API: {e_gemini_config}"); GEMINI_API_KEY = None
-else: logger_api.info("Gemini client initialization skipped (GEMINI_API_KEY not set).")
+@app.on_event("startup")
+async def startup_event():
+    logger_api.info("Running startup event: Initializing Gemini and ensuring credentials setup...")
+    # Initialize Gemini directly if needed globally
+    initialize_gemini()
+    from services.firestore_service import initialize_firestore
+    initialize_firestore()
+    # We still call initialize_google_clients to ensure the temp file
+    # and environment variable are set up correctly before the first request.
+    # The actual client object creation will be triggered by the first dependency call.
+    initialize_google_clients()
+    atexit.register(_cleanup_temp_cred_file_clients)
+    logger_api.info("Startup pre-initialization complete.")
 
-try:
-    gcp_project_id = API_GCP_PROJECT
-    creds = None
-    using_adc = False
-    if API_CREDENTIALS_PATH and os.path.exists(API_CREDENTIALS_PATH): creds = service_account.Credentials.from_service_account_file(API_CREDENTIALS_PATH)
-    elif gcp_project_id: using_adc = True
-    else: logger_api.error("Cannot initialize clients: GCP_PROJECT not set and no credentials file path provided.")
 
-    if gcp_project_id:
-        try: api_bigquery_client = bigquery.Client(credentials=creds, project=gcp_project_id) if not using_adc else bigquery.Client(project=gcp_project_id); logger_api.info(f"BigQuery Client Initialized. Project: {gcp_project_id}, Default Location: {DEFAULT_BQ_LOCATION}")
-        except Exception as e_bq: logger_api.error(f"Failed to initialize BigQuery Client: {e_bq}", exc_info=True); api_bigquery_client = None
-        if API_GCS_BUCKET:
-            try: api_storage_client = storage.Client(credentials=creds, project=gcp_project_id) if not using_adc else storage.Client(project=gcp_project_id); logger_api.info(f"Storage Client Initialized for bucket: {API_GCS_BUCKET}")
-            except Exception as e_storage: logger_api.error(f"Failed to initialize Storage Client: {e_storage}", exc_info=True); api_storage_client = None
-        else: logger_api.info("Storage client initialization skipped (GCS_BUCKET not set).")
-        if API_PUBSUB_TOPIC:
-            try: api_publisher = pubsub_v1.PublisherClient(credentials=creds) if not using_adc else pubsub_v1.PublisherClient(); api_topic_path = api_publisher.topic_path(gcp_project_id, API_PUBSUB_TOPIC); logger_api.info(f"Pub/Sub Publisher Client Initialized for topic: {api_topic_path}")
-            except Exception as e_pubsub: logger_api.error(f"Failed to initialize Pub/Sub Client: {e_pubsub}", exc_info=True); api_publisher = None; api_topic_path = None
-        # *** CORRECTED SYNTAX: Removed invalid 'load_dotenv' reference and closed string ***
-        else: logger_api.info("Pub/Sub client initialization skipped (PUBSUB_TOPIC not set).")
-except Exception as e:
-    logger_api.critical(f"API Error during client initialization setup: {e}", exc_info=True)
-    api_bigquery_client = None; api_storage_client = None; api_publisher = None
 
-# --- CORS Middleware ---
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logger_api.info(f"CORS enabled for origins: {allowed_origins}")
@@ -204,18 +182,21 @@ SCHEMA_CACHE_EXPIRY_SECONDS = 3600 # 1 hour
 
 
 
-def get_dataset_schema(dataset_id: str) -> List[TableSchema]:
+async def get_dataset_schema(dataset_id: str, bq_client: bigquery.Client) -> List[TableSchema]:
     """Fetches schema for all tables in a dataset."""
-    if not api_bigquery_client:
-        raise HTTPException(status_code=503, detail="BigQuery client not available.")
-    logger_api.info(f"Fetching schema for dataset: {dataset_id}")
+    # if not api_bigquery_client:
+    #     raise HTTPException(status_code=503, detail="BigQuery client not available.")
+    # logger_api.info(f"Fetching schema for dataset: {dataset_id}")
+    logger_api.info(f"Helper fetching schema for dataset: {dataset_id}")
     table_schemas: List[TableSchema] = []
     try:
-        tables_iterator = api_bigquery_client.list_tables(dataset_id)
+        # tables_iterator = api_bigquery_client.list_tables(dataset_id)
+        tables_iterator = bq_client.list_tables(dataset_id)
         for tbl_item in tables_iterator:
             try:
                 full_table_id = f"{tbl_item.project}.{tbl_item.dataset_id}.{tbl_item.table_id}"
-                table = api_bigquery_client.get_table(full_table_id)
+                # table = api_bigquery_client.get_table(full_table_id)
+                table = bq_client.get_table(full_table_id)
                 columns = [
                     ColumnInfo(name=field.name, type=field.field_type, mode=field.mode)
                     for field in table.schema
@@ -237,37 +218,51 @@ def get_dataset_schema(dataset_id: str) -> List[TableSchema]:
         raise HTTPException(status_code=500, detail=f"Could not fetch dataset schema: {str(e)}")
 # --- BigQuery API Endpoints (using bq_router) ---
 
+
+
+
 @bq_router.get("/schema", response_model=SchemaResponse)
-async def get_bigquery_dataset_schema(
-    dataset_id: str = Query(..., description="Full dataset ID (e.g., project.dataset)")
+async def get_bigquery_dataset_schema_endpoint( # Renamed function
+    dataset_id: str = Query(..., description="Full dataset ID (e.g., project.dataset)"),
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
     """Retrieves the schema (table names, column names, types) for all tables in a dataset."""
     # Consider adding caching here later for performance (e.g., using Redis or in-memory cache)
     try:
-        table_schemas = get_dataset_schema(dataset_id)
+        # table_schemas = get_dataset_schema(dataset_id)
+        table_schemas = await get_dataset_schema(dataset_id, bq_client) # Pass client
         return SchemaResponse(dataset_id=dataset_id, tables=table_schemas)
-    except HTTPException as http_exc:
-        # Re-raise HTTP exceptions directly
-        raise http_exc
-    except Exception as e:
-        # Catch unexpected errors from helper
-        logger_api.error(f"Unexpected error in get_dataset_schema endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve schema: {str(e)}")
+    except HTTPException as http_exc: raise http_exc
+    except Exception as e: logger_api.error(f"Schema endpoint error: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"Failed schema retrieval: {str(e)}")
+    # except HTTPException as http_exc:
+    #     # Re-raise HTTP exceptions directly
+    #     raise http_exc
+    # except Exception as e:
+    #     # Catch unexpected errors from helper
+    #     logger_api.error(f"Unexpected error in get_dataset_schema endpoint: {e}", exc_info=True)
+    #     raise HTTPException(status_code=500, detail=f"Failed to retrieve schema: {str(e)}")
 
 @bq_router.post("/nl2sql", response_model=NLQueryResponse)
-async def natural_language_to_sql(req: NLQueryRequest): # Accepts the modified request model
+async def natural_language_to_sql(
+    req: NLQueryRequest,
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
     """Converts a natural language prompt into a BigQuery SQL query using Gemini, potentially filtered by table prefix."""
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
+    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
     if not GEMINI_API_KEY: raise HTTPException(503, "NL-to-SQL service not configured.")
-    if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt cannot be empty.")
+    if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt required.")
+    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'.")
+    # if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt cannot be empty.")
 
-    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prefix: '{req.table_prefix or 'None'}'. Prompt: {req.prompt[:100]}...")
+    # logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prefix: '{req.table_prefix or 'None'}'. Prompt: {req.prompt[:100]}...")
 
     try:
         # 1. Fetch the *full* schema for the dataset first
-        all_table_schemas = get_dataset_schema(req.dataset_id)
-        if not all_table_schemas:
-             raise HTTPException(404, f"No tables/schema found for dataset {req.dataset_id}.")
+        all_table_schemas = await get_dataset_schema(req.dataset_id, bq_client)
+        if not all_table_schemas: raise HTTPException(404, f"No schema found for {req.dataset_id}.")
+        # all_table_schemas = get_dataset_schema(req.dataset_id)
+        # if not all_table_schemas:
+        #      raise HTTPException(404, f"No tables/schema found for dataset {req.dataset_id}.")
 
         # 2. Filter the schema based on the provided prefix (if any)
         filtered_table_schemas = all_table_schemas
@@ -360,105 +355,172 @@ Generated BigQuery SQL Query:
 # --- Other Endpoints ---
 # (Keep /jobs, /tables, /table-data, /jobs/{job_id}, /jobs/{job_id}/results, /api/upload-url, /api/trigger-etl, /api/health, / EXACTLY as they were)
 @bq_router.post("/jobs", response_model=JobSubmitResponse, status_code=202)
-async def submit_bigquery_job(req: QueryRequest):
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
-    if not req.sql or req.sql.isspace(): raise HTTPException(400, "SQL query cannot be empty.")
-    logger_api.info(f"Received job submission request. SQL: {req.sql[:100]}...")
+async def submit_bigquery_job(
+    req: QueryRequest,
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    """Submits a BigQuery job."""
+    if not req.sql or req.sql.isspace(): raise HTTPException(400, "SQL query required.")
+    logger_api.info(f"Submitting job: {req.sql[:100]}...")
     job_config = bigquery.QueryJobConfig(priority=req.priority.upper(), use_legacy_sql=req.use_legacy_sql)
-    if req.default_dataset:
-        try: project, dataset = req.default_dataset.split('.'); job_config.default_dataset = bigquery.DatasetReference(project, dataset)
-        except ValueError: raise HTTPException(400, "Invalid format for default_dataset. Use 'project.dataset'.")
+    if req.default_dataset: 
+        try: p, d = req.default_dataset.split('.'); job_config.default_dataset = bigquery.DatasetReference(p, d) 
+        except ValueError: raise HTTPException(400,"Invalid default_dataset format.")
     if req.max_bytes_billed is not None: job_config.maximum_bytes_billed = req.max_bytes_billed
     try:
-        query_job = api_bigquery_client.query(req.sql, job_config=job_config, location=req.location)
-        logger_api.info(f"BigQuery Job Submitted. Job ID: {query_job.job_id}, Location: {query_job.location}, Initial State: {query_job.state}")
+        query_job = bq_client.query(req.sql, job_config=job_config, location=req.location or DEFAULT_BQ_LOCATION) # Use injected client
         return JobSubmitResponse(job_id=query_job.job_id, state=query_job.state, location=query_job.location)
-    except BadRequest as e: logger_api.error(f"Invalid Query Syntax or Configuration: {e}", exc_info=False); raise HTTPException(400, f"Invalid query or configuration: {str(e)}")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error during job submission: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e: logger_api.error(f"Unexpected error submitting job: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+    except BadRequest as e: logger_api.error(f"Invalid Query: {e}"); raise HTTPException(400, f"Invalid query: {str(e)}")
+    except GoogleAPICallError as e: logger_api.error(f"BQ API Error: {e}", exc_info=True); raise HTTPException(502, f"BQ API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Job submission error: {e}", exc_info=True); raise HTTPException(500, f"Unexpected error: {str(e)}")
 
 
 
 
 
 @bq_router.get("/tables", response_model=List[TableListItem])
-async def list_bigquery_tables(dataset_id: str = Query(..., description="Full dataset ID")):
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
+async def list_bigquery_tables(
+    dataset_id: str = Query(..., description="Full dataset ID"),
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
     if not dataset_id: raise HTTPException(400, "dataset_id query parameter is required")
     logger_api.info(f"Listing tables for dataset: {dataset_id}")
     try:
-        tables_iterator = api_bigquery_client.list_tables(dataset_id)
+        # tables_iterator = api_bigquery_client.list_tables(dataset_id)
+        tables_iterator = bq_client.list_tables(dataset_id) # Use injected client
         results = [TableListItem(tableId=table.table_id) for table in tables_iterator]
-        logger_api.info(f"Found {len(results)} tables in dataset {dataset_id}")
+        # logger_api.info(f"Found {len(results)} tables in dataset {dataset_id}")
         return results
-    except NotFound: logger_api.warning(f"Dataset not found during table list: {dataset_id}"); raise HTTPException(404, f"Dataset not found: {dataset_id}")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error listing tables for {dataset_id}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e: logger_api.error(f"Unexpected error listing tables for {dataset_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred while listing tables: {str(e)}")
+    except NotFound: logger_api.warning(f"Dataset not found: {dataset_id}"); raise HTTPException(404, f"Dataset not found: {dataset_id}")
+    except GoogleAPICallError as e: logger_api.error(f"BQ API Error listing tables: {e}"); raise HTTPException(502, f"Error communicating with BQ API: {str(e)}")
+    except Exception as e: logger_api.error(f"Error listing tables: {e}"); raise HTTPException(500, f"Unexpected error: {str(e)}")
+    # except NotFound: logger_api.warning(f"Dataset not found during table list: {dataset_id}"); raise HTTPException(404, f"Dataset not found: {dataset_id}")
+    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error listing tables for {dataset_id}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
+    # except Exception as e: logger_api.error(f"Unexpected error listing tables for {dataset_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred while listing tables: {str(e)}")
+
+
 
 @bq_router.get("/table-data", response_model=TableDataResponse)
-async def get_table_data(dataset_id: str = Query(..., description="Full dataset ID"), table_id: str = Query(..., description="Table name"), page: int = Query(1, ge=1), limit: int = Query(10, ge=1, le=100)):
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
+async def get_table_data(
+    dataset_id: str = Query(..., description="Full dataset ID"),
+    table_id: str = Query(..., description="Table name"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
     full_table_id = f"{dataset_id}.{table_id}"
-    logger_api.info(f"Fetching preview data for table: {full_table_id}, page: {page}, limit: {limit}")
+    # logger_api.info(f"Fetching preview data for table: {full_table_id}, page: {page}, limit: {limit}")
+    logger_api.info(f"Fetching preview data: {full_table_id}, page: {page}, limit: {limit}")
     try:
-        table_ref = api_bigquery_client.get_table(full_table_id)
+        # table_ref = api_bigquery_client.get_table(full_table_id)
+        table_ref = bq_client.get_table(full_table_id) # Use injected client
         offset = (page - 1) * limit
-        rows_iterator = api_bigquery_client.list_rows(table_ref, start_index=offset, max_results=limit, timeout=60)
+        # rows_iterator = api_bigquery_client.list_rows(table_ref, start_index=offset, max_results=limit, timeout=60)
+        rows_iterator = bq_client.list_rows(table_ref, start_index=offset, max_results=limit, timeout=60) # Use injected client
         results = [serialize_bq_row(row) for row in rows_iterator]
         total_rows = table_ref.num_rows
         stats = TableStatsModel(rowCount=table_ref.num_rows, sizeBytes=table_ref.num_bytes, lastModified=table_ref.modified.isoformat() if table_ref.modified else None)
-        logger_api.info(f"Returning {len(results)} preview rows for {full_table_id} (page {page}), total rows: {total_rows}")
-        return TableDataResponse(rows=results, totalRows=total_rows, stats=stats)
-    except NotFound: logger_api.warning(f"Table not found during preview fetch: {full_table_id}"); raise HTTPException(404, f"Table not found: {full_table_id}")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e: logger_api.error(f"Unexpected error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred while fetching table preview: {str(e)}")
+        return TableDataResponse(rows=results, totalRows=table_ref.num_rows, stats=stats)
+    except NotFound: logger_api.warning(f"Table not found: {full_table_id}"); raise HTTPException(404, f"Table not found: {full_table_id}")
+    except GoogleAPICallError as e: logger_api.error(f"BQ API Error fetching preview: {e}"); raise HTTPException(502, f"BQ API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Error fetching preview: {e}"); raise HTTPException(500, f"Unexpected table preview error: {str(e)}")
+#         logger_api.info(f"Returning {len(results)} preview rows for {full_table_id} (page {page}), total rows: {total_rows}")
+#         return TableDataResponse(rows=results, totalRows=total_rows, stats=stats)
+#     except NotFound: logger_api.warning(f"Table not found during preview fetch: {full_table_id}"); raise HTTPException(404, f"Table not found: {full_table_id}")
+#     except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
+#     except Exception as e: logger_api.error(f"Unexpected error fetching preview data for {full_table_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred while fetching table preview: {str(e)}")
 
-@app.on_event("startup")
-def startup_event():
-    initialize_firestore()
+# @app.on_event("startup")
+# def startup_event():
+#     initialize_firestore()
 
 @bq_router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_bigquery_job_status(job_id: str = Path(...), location: str = Query(DEFAULT_BQ_LOCATION)):
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
-    logger_api.debug(f"Fetching status for Job ID: {job_id}, Location: {location}")
+async def get_bigquery_job_status(
+    job_id: str = Path(...),
+    location: str = Query(DEFAULT_BQ_LOCATION),
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
+    # logger_api.debug(f"Fetching status for Job ID: {job_id}, Location: {location}")
+    """Gets the status of a specific BigQuery job."""
+    logger_api.debug(f"Fetching status Job ID: {job_id}, Location: {location}")
     try:
-        job = api_bigquery_client.get_job(job_id, location=location)
-        error_detail = None
-        if job.error_result: error_detail = {"reason": job.error_result.get("reason"), "location": job.error_result.get("location"), "message": job.error_result.get("message")}
-        return JobStatusResponse(job_id=job.job_id, state=job.state, location=job.location, statement_type=job.statement_type, error_result=error_detail, user_email=job.user_email, creation_time=job.created, start_time=job.started, end_time=job.ended, total_bytes_processed=job.total_bytes_processed, num_dml_affected_rows=getattr(job, 'num_dml_affected_rows', None))
-    except NotFound: logger_api.warning(f"Job not found: {job_id} in location {location}"); raise HTTPException(404, f"Job '{job_id}' not found in location '{location}'.")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching job status: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e: logger_api.error(f"Unexpected error fetching job status for {job_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+        job = bq_client.get_job(job_id, location=location) # Use injected client
+        error_detail = job.error_result if job.error_result else None
+        # Manually map fields or ensure JobStatusResponse matches job properties
+        return JobStatusResponse(
+            job_id=job.job_id, state=job.state, location=job.location,
+            statement_type=job.statement_type, error_result=error_detail,
+            user_email=job.user_email, creation_time=job.created,
+            start_time=job.started, end_time=job.ended,
+            total_bytes_processed=job.total_bytes_processed,
+            num_dml_affected_rows=getattr(job, 'num_dml_affected_rows', None)
+        )
+    except NotFound: logger_api.warning(f"Job not found: {job_id}"); raise HTTPException(404, f"Job '{job_id}' not found.")
+    except GoogleAPICallError as e: logger_api.error(f"BQ API Error fetching status: {e}"); raise HTTPException(502, f"BQ API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Error fetching status: {e}"); raise HTTPException(500, f"Unexpected job status error: {str(e)}")
+    #     job = api_bigquery_client.get_job(job_id, location=location)
+    #     error_detail = None
+    #     if job.error_result: error_detail = {"reason": job.error_result.get("reason"), "location": job.error_result.get("location"), "message": job.error_result.get("message")}
+    #     return JobStatusResponse(job_id=job.job_id, state=job.state, location=job.location, statement_type=job.statement_type, error_result=error_detail, user_email=job.user_email, creation_time=job.created, start_time=job.started, end_time=job.ended, total_bytes_processed=job.total_bytes_processed, num_dml_affected_rows=getattr(job, 'num_dml_affected_rows', None))
+    # except NotFound: logger_api.warning(f"Job not found: {job_id} in location {location}"); raise HTTPException(404, f"Job '{job_id}' not found in location '{location}'.")
+    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching job status: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
+    # except Exception as e: logger_api.error(f"Unexpected error fetching job status for {job_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+
+
+
 
 @bq_router.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
-async def get_bigquery_job_results(job_id: str = Path(...), location: str = Query(DEFAULT_BQ_LOCATION), page_token: Optional[str] = Query(None), max_results: int = Query(100, ge=1, le=1000)):
-    if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
-    logger_api.debug(f"Fetching results for Job ID: {job_id}, Location: {location}, PageToken: {page_token}, MaxResults: {max_results}")
+async def get_bigquery_job_results(
+    job_id: str = Path(...),
+    location: str = Query(DEFAULT_BQ_LOCATION),
+    page_token: Optional[str] = Query(None),
+    max_results: int = Query(100, ge=1, le=1000),
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    """Gets the results of a completed BigQuery job."""
+    logger_api.debug(f"Fetching results Job ID: {job_id}, Location: {location}")
+    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
+    # logger_api.debug(f"Fetching results for Job ID: {job_id}, Location: {location}, PageToken: {page_token}, MaxResults: {max_results}")
     try:
-        job = api_bigquery_client.get_job(job_id, location=location)
-        if job.state != 'DONE': raise HTTPException(400, f"Job {job_id} is not complete. Current state: {job.state}")
-        if job.error_result: error_msg = job.error_result.get('message', 'Unknown error'); raise HTTPException(400, f"Job {job_id} failed: {error_msg}")
-        if not job.destination: logger_api.info(f"Job {job_id} completed but did not produce a destination table."); affected_rows = getattr(job, 'num_dml_affected_rows', 0); return JobResultsResponse(rows=[], total_rows_in_result_set=affected_rows if affected_rows is not None else 0, schema=[])
-        rows_iterator = api_bigquery_client.list_rows(job.destination, max_results=max_results, page_token=page_token, timeout=DEFAULT_JOB_TIMEOUT_SECONDS)
+        job = bq_client.get_job(job_id, location=location) # Use injected client
+        if job.state != 'DONE': raise HTTPException(400, f"Job not complete: {job.state}")
+        if job.error_result: err_msg = job.error_result.get('message', 'Unknown'); raise HTTPException(400, f"Job failed: {err_msg}")
+        if not job.destination: logger_api.info(f"Job {job_id} had no dest table."); affected_rows = getattr(job, 'num_dml_affected_rows', 0); return JobResultsResponse(rows=[], total_rows_in_result_set=affected_rows or 0, schema=[])
+        rows_iterator = bq_client.list_rows(job.destination, max_results=max_results, page_token=page_token, timeout=DEFAULT_JOB_TIMEOUT_SECONDS) # Use injected client
+        # job = api_bigquery_client.get_job(job_id, location=location)
+        # if job.state != 'DONE': raise HTTPException(400, f"Job {job_id} is not complete. Current state: {job.state}")
+        # if job.error_result: error_msg = job.error_result.get('message', 'Unknown error'); raise HTTPException(400, f"Job {job_id} failed: {error_msg}")
+        # if not job.destination: logger_api.info(f"Job {job_id} completed but did not produce a destination table."); affected_rows = getattr(job, 'num_dml_affected_rows', 0); return JobResultsResponse(rows=[], total_rows_in_result_set=affected_rows if affected_rows is not None else 0, schema=[])
+        # rows_iterator = api_bigquery_client.list_rows(job.destination, max_results=max_results, page_token=page_token, timeout=DEFAULT_JOB_TIMEOUT_SECONDS)
         serialized_rows = [serialize_bq_row(row) for row in rows_iterator]
         schema_info = serialize_bq_schema(rows_iterator.schema)
         return JobResultsResponse(rows=serialized_rows, total_rows_in_result_set=rows_iterator.total_rows, next_page_token=rows_iterator.next_page_token, schema=schema_info)
-    except NotFound: logger_api.warning(f"Job or destination table not found for job {job_id} in location {location}"); raise HTTPException(404, f"Job '{job_id}' or its results not found in location '{location}'.")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching job results: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e: logger_api.error(f"Unexpected error fetching job results for {job_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+    except NotFound: logger_api.warning(f"Job/results not found: {job_id}"); raise HTTPException(404, f"Job '{job_id}' results not found.")
+    except GoogleAPICallError as e: logger_api.error(f"BQ API Error fetching results: {e}"); raise HTTPException(502, f"BQ API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Error fetching results: {e}"); raise HTTPException(500, f"Unexpected job results error: {str(e)}")
+    # except NotFound: logger_api.warning(f"Job or destination table not found for job {job_id} in location {location}"); raise HTTPException(404, f"Job '{job_id}' or its results not found in location '{location}'.")
+    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching job results: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
+    # except Exception as e: logger_api.error(f"Unexpected error fetching job results for {job_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+
+
 
 # --- Upload/ETL Endpoints ---
 @app.get("/api/upload-url", tags=["Upload"], dependencies=[Depends(verify_token)])
 async def get_upload_url(
     filename: str = Query(..., description="Name of the file to upload."),
-    dataset_id: str = Query(..., description="The target BigQuery dataset ID this upload belongs to (used for GCS prefix).") # Added dataset_id
+    dataset_id: str = Query(..., description="Target dataset ID"),
+    storage_client: storage.Client = Depends(get_storage_client) # Inject storage client
 ):
     """Generates a GCS signed URL for uploading a file to a specific dataset's prefix."""
-    if not api_storage_client: logger_api.error("Cannot generate upload URL: Storage client not available."); raise HTTPException(503, "Storage service unavailable")
-    if not filename: raise HTTPException(400, "Filename parameter is required")
-    if not dataset_id: raise HTTPException(400, "dataset_id parameter is required") # Validate dataset_id
-    if not API_GCS_BUCKET: raise HTTPException(500, "GCS Bucket configuration missing on server.") # Check for the managed bucket
-
+    # if not api_storage_client: logger_api.error("Cannot generate upload URL: Storage client not available."); raise HTTPException(503, "Storage service unavailable")
+    # if not filename: raise HTTPException(400, "Filename parameter is required")
+    # if not dataset_id: raise HTTPException(400, "dataset_id parameter is required") # Validate dataset_id
+    # if not API_GCS_BUCKET: raise HTTPException(500, "GCS Bucket configuration missing on server.") # Check for the managed bucket
+    if not filename or not dataset_id: raise HTTPException(400, "Filename and dataset_id required")
+    if not API_GCS_BUCKET: raise HTTPException(500, "GCS Bucket config missing.")
     # Sanitize filename and dataset_id for path safety (basic example)
     clean_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
     # IMPORTANT: Implement proper sanitization/validation for dataset_id if it comes directly from user input
@@ -470,55 +532,97 @@ async def get_upload_url(
 
     logger_api.info(f"Generating signed URL for blob: {destination_blob_name} in MANAGED bucket {API_GCS_BUCKET} (Target Dataset: {dataset_id})")
     try:
-        bucket = api_storage_client.bucket(API_GCS_BUCKET); blob = bucket.blob(destination_blob_name)
+        bucket = storage_client.bucket(API_GCS_BUCKET) # Use injected client
+        blob = bucket.blob(destination_blob_name)
         url = blob.generate_signed_url(version="v4", expiration=timedelta(minutes=SIGNED_URL_EXPIRATION_MINUTES), method="PUT")
-        logger_api.info(f"Signed URL generated successfully for {destination_blob_name}")
-        # Return the full object name (including prefix) and the target dataset
+        logger_api.info(f"Generated signed URL for {destination_blob_name}")
         return {"url": url, "object_name": blob.name, "target_dataset_id": dataset_id}
+        # bucket = api_storage_client.bucket(API_GCS_BUCKET); blob = bucket.blob(destination_blob_name)
+        # url = blob.generate_signed_url(version="v4", expiration=timedelta(minutes=SIGNED_URL_EXPIRATION_MINUTES), method="PUT")
+        # logger_api.info(f"Signed URL generated successfully for {destination_blob_name}")
+        # # Return the full object name (including prefix) and the target dataset
+        # return {"url": url, "object_name": blob.name, "target_dataset_id": dataset_id}
     except NotFound: logger_api.error(f"GCS Bucket not found: {API_GCS_BUCKET}"); raise HTTPException(404, f"GCS Bucket '{API_GCS_BUCKET}' not found.")
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename} (dataset: {dataset_id}): {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
+    except GoogleAPICallError as e: logger_api.error(f"GCS API Error signed URL: {e}"); raise HTTPException(502, f"GCS API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Signed URL error: {e}"); raise HTTPException(500, f"Unexpected signed URL error: {str(e)}")
+    # except NotFound: logger_api.error(f"GCS Bucket not found: {API_GCS_BUCKET}"); raise HTTPException(404, f"GCS Bucket '{API_GCS_BUCKET}' not found.")
+    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename} (dataset: {dataset_id}): {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
 
 @app.post("/api/trigger-etl", tags=["ETL"], dependencies=[Depends(verify_token)])
-async def trigger_etl(payload: ETLRequest, request: Request):
-    logger_api.info(f"[DEBUG] /api/trigger-etl received payload: {payload.dict()}")
-    if not api_publisher or not api_topic_path: logger_api.error("Cannot trigger ETL: Publisher client not available."); raise HTTPException(503, "Messaging service unavailable")
+async def trigger_etl(
+    payload: ETLRequest,
+    request: Request, # Keep if needed for client_ip logging
+    publisher: pubsub_v1.PublisherClient = Depends(get_pubsub_publisher), # Inject publisher
+    topic_path: str = Depends(get_pubsub_topic_path) # Inject topic path
+):
+    # logger_api.info(f"[DEBUG] /api/trigger-etl received payload: {payload.dict()}")
+    # if not api_publisher or not api_topic_path: logger_api.error("Cannot trigger ETL: Publisher client not available."); raise HTTPException(503, "Messaging service unavailable")
     #if not payload.object_name or not payload.object_name.startswith("uploads/"): logger_api.warning(f"Invalid object_name received for ETL trigger: {payload.object_name}"); raise HTTPException(400, "Invalid object_name provided. Must start with 'uploads/'.")
-    safe_dataset_prefix = re.sub(r"[^a-zA-Z0-9_]", "_", payload.target_dataset_id)
-    if not payload.object_name or not payload.target_dataset_id:
-         logger_api.warning(f"Invalid payload content for ETL trigger: object_name or target_dataset_id is empty/null. Payload: {payload.dict()}")
-         raise HTTPException(400, "Invalid payload content: object_name and target_dataset_id must not be empty.")
+    # safe_dataset_prefix = re.sub(r"[^a-zA-Z0-9_]", "_", payload.target_dataset_id)
+    # if not payload.object_name or not payload.target_dataset_id:
+    #      logger_api.warning(f"Invalid payload content for ETL trigger: object_name or target_dataset_id is empty/null. Payload: {payload.dict()}")
+    #      raise HTTPException(400, "Invalid payload content: object_name and target_dataset_id must not be empty.")
+    # client_ip = request.client.host if request.client else "unknown"
+    # logger_api.info(f"Triggering ETL for object: {payload.object_name} (requested by {client_ip})")
+    """Triggers the ETL process by publishing a message to Pub/Sub."""
+    if not payload.object_name or not payload.target_dataset_id: raise HTTPException(400, "Invalid payload.")
     client_ip = request.client.host if request.client else "unknown"
-    logger_api.info(f"Triggering ETL for object: {payload.object_name} (requested by {client_ip})")
+    logger_api.info(f"Triggering ETL for: {payload.object_name} from {client_ip}")
     try:
-        message_data = { "object_name": payload.object_name, "target_dataset_id": payload.target_dataset_id }
-        data = json.dumps(message_data).encode("utf-8") # Sends the JSON string encoded
-        future = api_publisher.publish(api_topic_path, data=data)
+        # message_data = { "object_name": payload.object_name, "target_dataset_id": payload.target_dataset_id }
+        # data = json.dumps(message_data).encode("utf-8") # Sends the JSON string encoded
+        # future = api_publisher.publish(api_topic_path, data=data)
+        message_data = payload.dict()
+        data = json.dumps(message_data).encode("utf-8")
+        future = publisher.publish(topic_path, data=data) # Use injected client & path
         def pubsub_callback(f):
              try: message_id = f.result(); logger_api.info(f"Pub/Sub message published successfully for {payload.object_name}. Message ID: {message_id}")
              except Exception as pub_e: logger_api.error(f"Failed to publish Pub/Sub message for {payload.object_name}: {pub_e}", exc_info=True)
         future.add_done_callback(pubsub_callback)
         logger_api.info(f"ETL job queued successfully for {payload.object_name}")
         return {"status": "queued", "object_name": payload.object_name}
-    except GoogleAPICallError as e: logger_api.error(f"Google API Call Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with Pub/Sub API: {str(e)}")
-    except Exception as e: logger_api.error(f"Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
+    except TimeoutError:
+        logger_api.error(f"Timeout publishing ETL trigger for {payload.object_name} to Pub/Sub.")
+        raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, detail="Timeout communicating with messaging service.")
+    except GoogleAPICallError as e: logger_api.error(f"PubSub API Error trigger ETL: {e}"); raise HTTPException(502, f"PubSub API Error: {str(e)}")
+    except Exception as e: logger_api.error(f"Trigger ETL error: {e}"); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
+    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with Pub/Sub API: {str(e)}")
+    # except Exception as e: logger_api.error(f"Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
 
 
 
 
 # --- Optional Health Check ---
 @app.get("/api/health", tags=["Health"])
-async def health_check():
-    statuses = {}; overall_status = "ok"
-    if api_bigquery_client: statuses["bigquery"] = "ok"
-    else: statuses["bigquery"] = "unavailable"; overall_status = "unhealthy"
-    if API_GCS_BUCKET:
-        if api_storage_client: statuses["storage"] = "ok"
-        else: statuses["storage"] = "unavailable"; overall_status = "unhealthy"
-    if API_PUBSUB_TOPIC:
-        if api_publisher: statuses["pubsub"] = "ok"
-        else: statuses["pubsub"] = "unavailable"; overall_status = "unhealthy"
-    if overall_status == "unhealthy": raise HTTPException(status_code=503, detail=statuses)
+async def health_check( # Inject clients to check their status
+    bq_client: Optional[bigquery.Client] = Depends(get_bigquery_client, use_cache=False),
+    storage_client: Optional[storage.Client] = Depends(get_storage_client, use_cache=False),
+    publisher: Optional[pubsub_v1.PublisherClient] = Depends(get_pubsub_publisher, use_cache=False)
+):
+    """Checks the status of backend components and dependencies."""
+    statuses = {}
+    statuses["bigquery"] = "ok" if bq_client else "unavailable"
+    statuses["storage"] = "ok" if storage_client else "unavailable"
+    statuses["pubsub"] = "ok" if publisher else "unavailable"
+    statuses["gemini"] = "ok" if GEMINI_API_KEY else "unavailable"
+    overall_status = "ok" if all(s == "ok" for s in statuses.values()) else "unhealthy"
+    if overall_status == "unhealthy":
+        # Return 503 only if critical components fail
+        if statuses["bigquery"] == "unavailable" or statuses["firebase_auth"] == "uninitialized":
+             raise HTTPException(status_code=503, detail=statuses)
+        else: # Return 200 but indicate unhealthy state for non-critical issues
+             return {"status": overall_status, "components": statuses}
     return {"status": overall_status, "components": statuses}
+    # if api_bigquery_client: statuses["bigquery"] = "ok"
+    # else: statuses["bigquery"] = "unavailable"; overall_status = "unhealthy"
+    # if API_GCS_BUCKET:
+    #     if api_storage_client: statuses["storage"] = "ok"
+    #     else: statuses["storage"] = "unavailable"; overall_status = "unhealthy"
+    # if API_PUBSUB_TOPIC:
+    #     if api_publisher: statuses["pubsub"] = "ok"
+    #     else: statuses["pubsub"] = "unavailable"; overall_status = "unhealthy"
+    # if overall_status == "unhealthy": raise HTTPException(status_code=503, detail=statuses)
+    # return {"status": overall_status, "components": statuses}
 
 # --- Root Endpoint ---
 @app.get("/", tags=["Root"], include_in_schema=False)
@@ -810,15 +914,24 @@ async def suggest_visualization(req: SuggestVizRequest):
 # --- Make sure you include the router in your main app ---
 # Example: app.include_router(bq_router) should be present somewhere
 # --- New Endpoint to List Datasets ---
+
+
+
 @bq_router.get("/datasets", response_model=DatasetListResponse, tags=["BigQuery"])
 async def list_bigquery_datasets(
-    # Add any query parameters if needed later (e.g., filter by label)
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
     # filter_label: Optional[str] = Query(None, description="Filter datasets by label (e.g., 'env:prod')")
 ):
     """Retrieves a list of BigQuery datasets accessible by the service account."""
-    if not api_bigquery_client:
-        logger_api.error("Cannot list datasets: BigQuery client not available.")
-        raise HTTPException(status_code=503, detail="BigQuery client not available.")
+    # if not api_bigquery_client:
+    #     logger_api.error("Cannot list datasets: BigQuery client not available.")
+    #     raise HTTPException(status_code=503, detail="BigQuery client not available.")
+
+    # logger_api.info(f"Listing BigQuery datasets for project: {API_GCP_PROJECT}")
+    # datasets_list: List[DatasetListItemModel] = []
+    if not API_GCP_PROJECT: # Still need project ID from config
+        logger_api.error("Cannot list datasets: GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
 
     logger_api.info(f"Listing BigQuery datasets for project: {API_GCP_PROJECT}")
     datasets_list: List[DatasetListItemModel] = []
@@ -826,15 +939,23 @@ async def list_bigquery_datasets(
         # list_datasets returns an iterator of google.cloud.bigquery.DatasetListItem
         datasets_list: List[DatasetListItemModel] = []
 
-        for dataset_item in api_bigquery_client.list_datasets(project=API_GCP_PROJECT):
+        # for dataset_item in api_bigquery_client.list_datasets(project=API_GCP_PROJECT):
+        for dataset_item in bq_client.list_datasets(project=API_GCP_PROJECT):
             # Extract the dataset ID
-            ds_ref: DatasetReference = dataset_item.reference
-
+            # ds_ref: DatasetReference = dataset_item.reference
+            ds_ref: bigquery.DatasetReference = dataset_item.reference
             # Fetch full metadata (this is where location lives)
-            ds = api_bigquery_client.get_dataset(ds_ref)
+            # ds = api_bigquery_client.get_dataset(ds_ref)
+            ds = bq_client.get_dataset(ds_ref)
             # Optional: Add filtering logic here if needed based on labels, etc.
             # if filter_label and filter_label not in (dataset_item.labels or {}):
             #     continue
+            # datasets_list.append(
+            #     DatasetListItemModel(
+            #         datasetId=ds.dataset_id,
+            #         location=ds.location
+            #     )
+            # )
             datasets_list.append(
                 DatasetListItemModel(
                     datasetId=ds.dataset_id,
@@ -844,14 +965,22 @@ async def list_bigquery_datasets(
 
         logger_api.info(f"Found {len(datasets_list)} datasets.")
         return DatasetListResponse(datasets=datasets_list)
-
     except GoogleAPICallError as e:
-        logger_api.error(f"Google API Call Error listing datasets: {e}", exc_info=True)
+        logger_api.error(f"BQ API Error listing datasets: {e}")
         raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
     except Exception as e:
         logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
+    # except GoogleAPICallError as e:
+    #     logger_api.error(f"Google API Call Error listing datasets: {e}", exc_info=True)
+    #     raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
+    # except Exception as e:
+    #     logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
+    #     raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
     
+
+
+
 
 
 # --- BigQuery API Endpoints (using bq_router) ---
@@ -870,16 +999,16 @@ async def list_bigquery_datasets(
 )
 async def create_bigquery_dataset(
     req: CreateDatasetRequest,
-    # The 'user_data' is available if needed from require_admin, but often unused directly here
-    # user_data: dict = Depends(require_admin) # No need to declare again if in router deps
+    bq_client: bigquery.Client = Depends(get_bigquery_client), # Inject client
+    # user_data: dict = Depends(require_admin) # Already in router deps
 ):
     """
     Creates a new BigQuery dataset. (Admin Only)
     Requires the requesting user to have the 'admin' role stored in Firestore.
     """
-    if not api_bigquery_client:
-        logger_api.error("Cannot create dataset: BigQuery client not available.")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
+    # if not api_bigquery_client:
+    #     logger_api.error("Cannot create dataset: BigQuery client not available.")
+    #     raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
     if not API_GCP_PROJECT:
         logger_api.error("Cannot create dataset: GCP_PROJECT not configured.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
@@ -893,7 +1022,8 @@ async def create_bigquery_dataset(
         if req.description: dataset.description = req.description
         if req.labels: dataset.labels = req.labels
 
-        created_dataset = api_bigquery_client.create_dataset(dataset, timeout=30, exists_ok=False)
+        # created_dataset = api_bigquery_client.create_dataset(dataset, timeout=30, exists_ok=False)
+        created_dataset = bq_client.create_dataset(dataset, timeout=30, exists_ok=False)
         logger_api.info(f"Admin successfully created dataset: {created_dataset.full_dataset_id}")
 
         return DatasetCreatedResponse(
@@ -936,16 +1066,17 @@ async def create_bigquery_dataset(
 )
 async def delete_bigquery_dataset(
     dataset_id: str = Path(..., description="The ID of the dataset to delete.", example="my_team_dataset_to_delete"),
-    admin_user: dict = Depends(require_admin) # Get admin user data for logging if needed
+    admin_user: dict = Depends(require_admin), # Get admin user data for logging if needed
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
     """
     Deletes an existing BigQuery dataset, including all tables within it.
     Requires the requesting user to have the 'admin' role stored in Firestore.
     """
     admin_uid = admin_user.get("uid", "unknown_admin") # Get admin UID for logging
-    if not api_bigquery_client:
-        logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': BigQuery client not available.")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
+    # if not api_bigquery_client:
+    #     logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': BigQuery client not available.")
+    #     raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
     if not API_GCP_PROJECT:
         logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': GCP_PROJECT not configured.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
@@ -959,7 +1090,10 @@ async def delete_bigquery_dataset(
         # Delete the dataset.
         # delete_contents=True: Deletes tables within the dataset. If False, deletion fails if dataset is not empty.
         # not_found_ok=False: Raises NotFound exception if the dataset doesn't exist.
-        api_bigquery_client.delete_dataset(
+        # api_bigquery_client.delete_dataset(
+        #     dataset_ref, delete_contents=True, not_found_ok=False
+        # )
+        bq_client.delete_dataset(
             dataset_ref, delete_contents=True, not_found_ok=False
         )
 
@@ -998,4 +1132,4 @@ if __name__ == "__main__":
     api_host = os.getenv("API_HOST", "127.0.0.1")
     api_port = int(os.getenv("API_PORT", 8000))
     logger_api.info(f"Starting Uvicorn server on http://{api_host}:{api_port}")
-    uvicorn.run("main:app", host=api_host, port=api_port, reload=True)
+    uvicorn.run("main:app", host=api_host, port=api_port, reload=False)
