@@ -4,7 +4,7 @@ import json
 import base64
 import logging
 import firebase_admin
-from typing import Optional
+from typing import Optional,List 
 from firebase_admin import credentials, firestore
 import logging
 import os # os might not be needed anymore if not checking path
@@ -95,3 +95,39 @@ async def get_user_role(user_uid: str) -> Optional[str]:
         # Catch any unexpected errors during the Firestore interaction
         logger_firestore.error(f"Error during Firestore query for UID {user_uid}: {e}", exc_info=True)
         return None # Indicate error fetching role
+    
+async def get_user_accessible_datasets(user_uid: str) -> Optional[List[str]]:
+    """
+    Fetches the list of dataset IDs a specific user can access from Firestore.
+    Returns a list of dataset IDs, an empty list, or None on error/not found.
+    """
+    global db
+    if db is None:
+        logger_firestore.error("Firestore client is None. Cannot fetch accessible datasets.")
+        return None
+
+    logger_firestore.info(f"Fetching accessible datasets for UID: '{user_uid}'")
+    try:
+        user_doc_ref = db.collection('users').document(user_uid)
+        user_doc =  user_doc_ref.get() # Use await
+
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            datasets = user_data.get('accessible_datasets')
+
+            # IMPORTANT: Check if it's a list of strings
+            if isinstance(datasets, list) and all(isinstance(item, str) for item in datasets):
+                logger_firestore.info(f"Accessible datasets found for UID {user_uid}: {len(datasets)} dataset(s)")
+                return datasets
+            elif datasets is None:
+                 logger_firestore.info(f"No 'accessible_datasets' field found for UID {user_uid}. Returning empty list.")
+                 return [] # Treat missing field as no access explicitly granted
+            else:
+                logger_firestore.warning(f"Invalid 'accessible_datasets' field (not a list of strings) for UID {user_uid}. Data: {datasets}. Returning empty list.")
+                return [] # Treat invalid data as no access explicitly granted
+        else:
+            logger_firestore.warning(f"User document NOT FOUND for UID: '{user_uid}' when fetching datasets. Returning None.")
+            return None # No document means no specific permissions known
+    except Exception as e:
+        logger_firestore.error(f"Error fetching accessible datasets for UID {user_uid}: {e}", exc_info=True)
+        return None

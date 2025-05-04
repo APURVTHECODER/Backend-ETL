@@ -27,7 +27,7 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore # Import initializer
+from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
@@ -919,10 +919,19 @@ async def suggest_visualization(req: SuggestVizRequest):
 
 @bq_router.get("/datasets", response_model=DatasetListResponse, tags=["BigQuery"])
 async def list_bigquery_datasets(
+    user: dict = Depends(verify_token),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
     # filter_label: Optional[str] = Query(None, description="Filter datasets by label (e.g., 'env:prod')")
 ):
     """Retrieves a list of BigQuery datasets accessible by the service account."""
+    user_uid = user.get("uid")
+    if not user_uid:
+        # This check is defensive, verify_token should handle missing uid
+        logger_api.error("UID missing from verified token in /datasets endpoint.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication error: User ID not found.",
+        )
     # if not api_bigquery_client:
     #     logger_api.error("Cannot list datasets: BigQuery client not available.")
     #     raise HTTPException(status_code=503, detail="BigQuery client not available.")
@@ -934,19 +943,88 @@ async def list_bigquery_datasets(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
 
     logger_api.info(f"Listing BigQuery datasets for project: {API_GCP_PROJECT}")
-    datasets_list: List[DatasetListItemModel] = []
+    # datasets_list: List[DatasetListItemModel] = []
     try:
+        user_role = await get_user_role(user_uid)
+        logger_api.info(f"User {user_uid} role determined as: {user_role}")
         # list_datasets returns an iterator of google.cloud.bigquery.DatasetListItem
-        datasets_list: List[DatasetListItemModel] = []
+        # datasets_list: List[DatasetListItemModel] = []
+        all_datasets_from_bq: List[DatasetListItemModel] = []
+        try:
+            datasets_iterator = bq_client.list_datasets(project=API_GCP_PROJECT)
+            for dataset_item in datasets_iterator:
+                ds_ref = dataset_item.reference
+                # Fetching full dataset info can be slow if there are many datasets.
+                # Consider if just datasetId from list_datasets is enough,
+                # but the model requires 'location'.
+                try:
+                    ds = bq_client.get_dataset(ds_ref)
+                    all_datasets_from_bq.append(
+                        DatasetListItemModel(
+                            datasetId=ds.dataset_id,
+                            location=ds.location
+                        )
+                    )
+                except Exception as get_ds_error:
+                     logger_api.warning(f"Could not get full info for dataset {ds_ref.dataset_id}, skipping: {get_ds_error}")
 
+            logger_api.info(f"Fetched {len(all_datasets_from_bq)} datasets from BQ for project {API_GCP_PROJECT}")
+
+        except GoogleAPICallError as e:
+            logger_api.error(f"BQ API Error listing datasets from BQ: {e}")
+            raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
+        except Exception as e:
+             logger_api.error(f"Unexpected error listing datasets from BQ: {e}", exc_info=True)
+             raise HTTPException(status_code=500, detail=f"Server error listing datasets: {str(e)}")
+
+
+        # 3. Filter based on role/permissions
+        final_datasets_list: List[DatasetListItemModel] = []
+
+        if user_role == 'admin':
+            logger_api.info(f"User {user_uid} is admin. Returning all {len(all_datasets_from_bq)} fetched datasets.")
+            final_datasets_list = all_datasets_from_bq
+        else:
+            logger_api.info(f"User {user_uid} is not admin. Fetching accessible datasets from Firestore.")
+            accessible_dataset_ids = await get_user_accessible_datasets(user_uid)
+
+            if accessible_dataset_ids is None:
+                # Error fetching from Firestore or user not found
+                logger_api.warning(f"Could not determine accessible datasets for user {user_uid} (Firestore error or user not found). Returning empty list.")
+                final_datasets_list = []
+            elif not accessible_dataset_ids:
+                # User found, but no datasets assigned (empty list)
+                logger_api.info(f"User {user_uid} has no datasets assigned in Firestore. Returning empty list.")
+                final_datasets_list = []
+            else:
+                # User found with specific datasets assigned - Filter the BQ list
+                logger_api.info(f"User {user_uid} has access to {len(accessible_dataset_ids)} specific datasets. Filtering BQ list.")
+                allowed_set = set(accessible_dataset_ids) # Use a set for faster lookups
+                final_datasets_list = [
+                    ds for ds in all_datasets_from_bq if ds.datasetId in allowed_set
+                ]
+                logger_api.info(f"Filtered list size for user {user_uid}: {len(final_datasets_list)}")
+
+        # Sort alphabetically by datasetId before returning
+        final_datasets_list.sort(key=lambda ds: ds.datasetId)
+
+        return DatasetListResponse(datasets=final_datasets_list)
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions from BQ calls or config errors
+        raise http_exc
+    except Exception as e:
+        # Catch unexpected errors during role fetching or filtering logic
+        logger_api.error(f"Unexpected error processing dataset list for user {user_uid}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected server error occurred while retrieving datasets.")
         # for dataset_item in api_bigquery_client.list_datasets(project=API_GCP_PROJECT):
-        for dataset_item in bq_client.list_datasets(project=API_GCP_PROJECT):
+        # for dataset_item in bq_client.list_datasets(project=API_GCP_PROJECT):
             # Extract the dataset ID
             # ds_ref: DatasetReference = dataset_item.reference
-            ds_ref: bigquery.DatasetReference = dataset_item.reference
+            # ds_ref: bigquery.DatasetReference = dataset_item.reference
             # Fetch full metadata (this is where location lives)
             # ds = api_bigquery_client.get_dataset(ds_ref)
-            ds = bq_client.get_dataset(ds_ref)
+            # ds = bq_client.get_dataset(ds_ref)
             # Optional: Add filtering logic here if needed based on labels, etc.
             # if filter_label and filter_label not in (dataset_item.labels or {}):
             #     continue
@@ -956,21 +1034,21 @@ async def list_bigquery_datasets(
             #         location=ds.location
             #     )
             # )
-            datasets_list.append(
-                DatasetListItemModel(
-                    datasetId=ds.dataset_id,
-                    location=ds.location
-                )
-            )
+            # datasets_list.append(
+            #     DatasetListItemModel(
+            #         datasetId=ds.dataset_id,
+            #         location=ds.location
+            #     )
+            # )
 
-        logger_api.info(f"Found {len(datasets_list)} datasets.")
-        return DatasetListResponse(datasets=datasets_list)
-    except GoogleAPICallError as e:
-        logger_api.error(f"BQ API Error listing datasets: {e}")
-        raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
-    except Exception as e:
-        logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
+    #     logger_api.info(f"Found {len(datasets_list)} datasets.")
+    #     return DatasetListResponse(datasets=datasets_list)
+    # except GoogleAPICallError as e:
+    #     logger_api.error(f"BQ API Error listing datasets: {e}")
+    #     raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
+    # except Exception as e:
+    #     logger_api.error(f"Unexpected error listing datasets: {e}", exc_info=True)
+    #     raise HTTPException(status_code=500, detail=f"An unexpected error occurred while listing datasets: {str(e)}")
     # except GoogleAPICallError as e:
     #     logger_api.error(f"Google API Call Error listing datasets: {e}", exc_info=True)
     #     raise HTTPException(status_code=502, detail=f"Error communicating with BigQuery API: {str(e)}")
