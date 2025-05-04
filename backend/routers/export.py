@@ -103,7 +103,7 @@ async def fetch_bq_data_to_dataframe(
         logger_export.debug(f"Waiting for helper query job {query_job.job_id} (timeout: {timeout_seconds}s)...")
 
         # Use to_dataframe with timeout - this waits for the job to complete
-        df = query_job.to_dataframe(timeout=timeout_seconds)
+        df = query_job.to_dataframe()
 
         logger_export.info(f"Helper fetched {len(df)} rows into DataFrame for job {query_job.job_id}.")
         return df
