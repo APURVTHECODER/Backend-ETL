@@ -1,5 +1,45 @@
-fastapi
-uvicorn[standard]
-google-cloud-storage
-google-cloud-pubsub
-python-dotenv
+# Backend-ETL/backend/requirements.txt
+
+fastapi >= 0.115 # Or your specific version
+uvicorn[standard] >= 0.34 # Or your specific version
+
+# Google Cloud Libraries (Core)
+google-cloud-bigquery >= 3.31
+google-cloud-storage >= 2.19
+google-cloud-pubsub >= 2.29
+google-cloud-firestore >= 2.20
+google-auth >= 2.39
+
+# Firebase Admin
+firebase-admin >= 6.8
+
+# Google Generative AI (Fixes the ModuleNotFoundError)
+google-generativeai >= 0.8.5
+
+# Environment Variables
+python-dotenv >= 1.1.0
+
+# Data Handling (if used directly in backend/worker)
+pandas >= 2.2.3
+# openpyxl >= 3.1.5 # Needed by pandas for Excel? Only if backend directly reads/writes Excel
+
+# Common FastAPI/Uvicorn dependencies (often included via [standard])
+# starlette >= 0.46.2
+# pydantic >= 2.11.3
+# anyio # Dependency of FastAPI/Starlette
+# sniffio # Dependency of Anyio/HTTPX
+# h11 # Dependency of Uvicorn
+
+# Optional but recommended for HTTP requests if used directly
+# requests >= 2.32.3
+# httpx >= 0.28.1
+
+# --- Considerations ---
+# Add other direct dependencies used by your backend code here.
+# For example, if you use the specific google-cloud-aiplatform or vertexai SDKs
+# directly in the backend (not just chatbot router), add them:
+# google-cloud-aiplatform >= 1.71
+# vertexai >= 1.71
+
+# If the chatbot router is complex and has its own dependencies, ensure they are here.
+# openai # Only if you use the OpenAI client directly in the backend
