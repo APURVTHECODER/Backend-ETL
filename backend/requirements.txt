@@ -9,7 +9,7 @@ google-cloud-storage >= 2.19
 google-cloud-pubsub >= 2.29
 google-cloud-firestore >= 2.20
 google-auth >= 2.39
-
+pydantic[email]
 # Firebase Admin
 firebase-admin >= 6.8
 
