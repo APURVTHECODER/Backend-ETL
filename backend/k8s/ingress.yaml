@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    # Uncomment and set if you have a reserved static IP:
+    # kubernetes.io/ingress.global-static-ip-name: "your-static-ip-name"
+    # Uncomment and set if using GKE ManagedCertificate for HTTPS:
+    # networking.gke.io/managed-certificates: "your-managed-cert-name"
+spec:
+  defaultBackend:
+    service:
+      name: frontend-service    # Change or remove if no frontend
+      port:
+        number: 80
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service    # All other traffic
+                port:
+                  number: 80
