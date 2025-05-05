@@ -85,6 +85,15 @@ app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credenti
 logger_api.info(f"CORS enabled for origins: {allowed_origins}")
 
 # --- Pydantic Models ---
+# --- Pydantic Models for Prompt Suggestion ---
+class PromptSuggestionRequest(BaseModel):
+    current_prompt: str = Field(..., description="The partial prompt typed by the user.")
+    # Optional: Add dataset_id if you want suggestions tailored to schema later
+    # dataset_id: Optional[str] = None
+
+class PromptSuggestionResponse(BaseModel):
+    suggestions: List[str] = Field(default_factory=list, description="List of suggested prompt completions or improvements.")
+    error: Optional[str] = None
 class TableListItem(BaseModel): tableId: str
 class QueryRequest(BaseModel):
     sql: str
@@ -1194,7 +1203,99 @@ async def delete_bigquery_dataset(
 
 # +++ END NEW ENDPOINT: Delete Dataset +++
 
+@bq_router.post("/suggest-prompt", response_model=PromptSuggestionResponse)
+async def suggest_prompt_completion(req: PromptSuggestionRequest):
+    """
+    Provides AI-generated suggestions to complete or improve a natural language prompt
+    for data analysis.
+    """
+    if not GEMINI_API_KEY:
+        logger_api.warning("Prompt suggestion requested but Gemini API key not set.")
+        # Return empty list gracefully, frontend can handle lack of suggestions
+        return PromptSuggestionResponse(suggestions=[], error="AI suggestion service not configured.")
 
+    if not req.current_prompt or len(req.current_prompt.strip()) < 3:
+         # Don't bother AI with very short/empty prompts
+         return PromptSuggestionResponse(suggestions=[])
+
+    logger_api.info(f"Received prompt suggestion request for: '{req.current_prompt}'")
+
+    # --- Construct the AI Prompt ---
+    # This prompt asks the AI to act as a prompt helper
+    suggestion_ai_prompt = f"""You are an assistant helping a user write clear natural language prompts for data analysis (e.g., to query BigQuery). The user is currently typing the following:
+
+"{req.current_prompt}"
+
+Suggest 2-4 concise ways to complete or improve this prompt to make it more specific and effective for data analysis. Focus on clarity, mentioning potential metrics (like 'total', 'average'), dimensions (like 'per category', 'over time'), or timeframes ('last month', 'yesterday'). Do NOT generate SQL code.
+
+Return ONLY a valid JSON array of strings, where each string is a suggested prompt. Example format:
+["show total sales per product category", "show average order value by month"]
+
+JSON Array of Suggestions:
+"""
+
+    try:
+        # --- Call Gemini API ---
+        # Using a model optimized for fast responses is good here
+        model = genai.GenerativeModel(
+            'gemini-1.5-flash-latest',
+             generation_config=genai.types.GenerationConfig(
+                 response_mime_type="application/json", # Request JSON output
+                 temperature=0.5 # Allow some creativity in suggestions
+             )
+        )
+
+        response = await model.generate_content_async(
+             suggestion_ai_prompt,
+             request_options={'timeout': GEMINI_REQUEST_TIMEOUT // 2} # Use shorter timeout for suggestions
+         )
+
+        # --- Process Response ---
+        logger_api.debug(f"Gemini Raw Suggestion Response: {response.text}")
+
+        suggestions = []
+        error_msg = None
+        try:
+            # Clean potential markdown ```json ... ``` artifacts
+            cleaned_response = response.text.strip()
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[len("```json"):].strip()
+            if cleaned_response.endswith("```"):
+                cleaned_response = cleaned_response[:-len("```")].strip()
+
+            if not cleaned_response:
+                 logger_api.warning("Gemini returned empty string for prompt suggestions.")
+                 error_msg = "AI returned no suggestions."
+            else:
+                # Parse the JSON array
+                parsed_suggestions = json.loads(cleaned_response)
+                if isinstance(parsed_suggestions, list) and all(isinstance(s, str) for s in parsed_suggestions):
+                    suggestions = parsed_suggestions
+                    logger_api.info(f"Generated {len(suggestions)} prompt suggestions.")
+                else:
+                    logger_api.warning(f"Gemini response was not a valid JSON array of strings: {parsed_suggestions}")
+                    error_msg = "AI response format was unexpected."
+
+        except json.JSONDecodeError as json_err:
+             logger_api.error(f"Failed to parse JSON response from Gemini for suggestions: {json_err}\nResponse Text: {response.text}")
+             error_msg = "AI response was not valid JSON."
+        except Exception as e_parse:
+             logger_api.error(f"Error processing Gemini suggestions response: {e_parse}", exc_info=True)
+             error_msg = "Error processing AI suggestions."
+
+        return PromptSuggestionResponse(suggestions=suggestions, error=error_msg)
+
+    # --- Error Handling for API Call ---
+    except DeadlineExceeded:
+        logger_api.error("Gemini API call for prompt suggestions timed out.")
+        # Don't raise HTTPException, return error in response body
+        return PromptSuggestionResponse(suggestions=[], error="AI suggestion request timed out.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Gemini API call error for prompt suggestions: {e}", exc_info=True)
+        return PromptSuggestionResponse(suggestions=[], error="Error communicating with AI service.")
+    except Exception as e:
+        logger_api.error(f"Unexpected error during prompt suggestion generation: {e}", exc_info=True)
+        return PromptSuggestionResponse(suggestions=[], error="Failed to generate suggestions.")
 # +++ END NEW ENDPOINT: Create Dataset +++
 
 # ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
