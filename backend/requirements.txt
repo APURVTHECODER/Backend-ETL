@@ -23,6 +23,7 @@ python-dotenv >= 1.1.0
 pandas >= 2.2.3
 # openpyxl >= 3.1.5 # Needed by pandas for Excel? Only if backend directly reads/writes Excel
 db-dtypes>=1.0.0
+openpyxl>=3.1.2
 # Common FastAPI/Uvicorn dependencies (often included via [standard])
 # starlette >= 0.46.2
 # pydantic >= 2.11.3
