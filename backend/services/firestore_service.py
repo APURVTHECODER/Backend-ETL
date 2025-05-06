@@ -4,11 +4,13 @@ import json
 import base64
 import logging
 import firebase_admin
-from typing import Optional
-from firebase_admin import credentials, firestore
+from typing import Optional,List 
+from firebase_admin import credentials, firestore, auth
 import logging
 import os # os might not be needed anymore if not checking path
 from typing import Optional
+import asyncio # For potential concurrency later
+
 
 logger_firestore = logging.getLogger(__name__ + "_firestore")
 db: Optional[firestore.Client] = None # Initialize db as None, optionally type hint
@@ -95,3 +97,122 @@ async def get_user_role(user_uid: str) -> Optional[str]:
         # Catch any unexpected errors during the Firestore interaction
         logger_firestore.error(f"Error during Firestore query for UID {user_uid}: {e}", exc_info=True)
         return None # Indicate error fetching role
+    
+async def get_user_accessible_datasets(user_uid: str) -> Optional[List[str]]:
+    """
+    Fetches the list of dataset IDs a specific user can access from Firestore.
+    Returns a list of dataset IDs, an empty list, or None on error/not found.
+    """
+    global db
+    if db is None:
+        logger_firestore.error("Firestore client is None. Cannot fetch accessible datasets.")
+        return None
+
+    logger_firestore.info(f"Fetching accessible datasets for UID: '{user_uid}'")
+    try:
+        user_doc_ref = db.collection('users').document(user_uid)
+        user_doc =  user_doc_ref.get() # Use await
+
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            datasets = user_data.get('accessible_datasets')
+
+            # IMPORTANT: Check if it's a list of strings
+            if isinstance(datasets, list) and all(isinstance(item, str) for item in datasets):
+                logger_firestore.info(f"Accessible datasets found for UID {user_uid}: {len(datasets)} dataset(s)")
+                return datasets
+            elif datasets is None:
+                 logger_firestore.info(f"No 'accessible_datasets' field found for UID {user_uid}. Returning empty list.")
+                 return [] # Treat missing field as no access explicitly granted
+            else:
+                logger_firestore.warning(f"Invalid 'accessible_datasets' field (not a list of strings) for UID {user_uid}. Data: {datasets}. Returning empty list.")
+                return [] # Treat invalid data as no access explicitly granted
+        else:
+            logger_firestore.warning(f"User document NOT FOUND for UID: '{user_uid}' when fetching datasets. Returning None.")
+            return None # No document means no specific permissions known
+    except Exception as e:
+        logger_firestore.error(f"Error fetching accessible datasets for UID {user_uid}: {e}", exc_info=True)
+        return None
+    
+
+
+async def set_user_access(user_uid: str, role: str, dataset_ids: Optional[List[str]]) -> bool:
+    """
+    Sets or updates the role and accessible datasets for a user in Firestore.
+    Creates the user document if it doesn't exist. Uses merge=True.
+
+    Args:
+        user_uid: The Firebase UID of the user.
+        role: The role to assign ('admin' or 'user').
+        dataset_ids: A list of dataset IDs if role is 'user', otherwise ignored.
+
+    Returns:
+        True if the operation was successful, False otherwise.
+    """
+    global db
+    if db is None:
+        logger_firestore.error(f"Firestore client is None. Cannot set access for UID: {user_uid}")
+        return False
+
+    if role not in ['admin', 'user']:
+        logger_firestore.error(f"Invalid role '{role}' provided for UID: {user_uid}")
+        return False
+
+    logger_firestore.info(f"Setting access for UID: {user_uid} - Role: {role}")
+
+    try:
+        user_doc_ref = db.collection('users').document(user_uid)
+        data_to_set = {'role': role}
+
+        if role == 'user':
+            data_to_set['accessible_datasets'] = dataset_ids if dataset_ids else []
+            logger_firestore.info(f"Assigning {len(data_to_set['accessible_datasets'])} datasets to user {user_uid}")
+        else:
+            logger_firestore.info(f"Assigning admin role to {user_uid}. Dataset list assignment skipped.")
+            # Optional: data_to_set['accessible_datasets'] = firestore.DELETE_FIELD
+
+        # Use set with merge=True to create or update the document non-destructively
+        # --- REMOVED 'await' FROM THE NEXT LINE ---
+        user_doc_ref.set(data_to_set, merge=True)
+
+        logger_firestore.info(f"Successfully set access for UID: {user_uid}")
+        return True
+
+    except Exception as e:
+        logger_firestore.error(f"Error setting access for UID {user_uid}: {e}", exc_info=True)
+        return False
+
+
+logger_firestore = logging.getLogger(__name__ + "_firestore") # Ensure logger is defined
+
+
+async def get_uid_from_email(email: str) -> Optional[str]:
+    """
+    Finds the Firebase UID associated with an email address.
+
+    Args:
+        email: The email address to look up.
+
+    Returns:
+        The UID string if found, None otherwise.
+    """
+    try:
+        # Ensure SDK is initialized! Add check if needed:
+        # if not firebase_admin._apps:
+        #     logger_firestore.critical("Firebase Admin SDK not initialized!")
+        #     return None # Or raise an exception
+
+        user = auth.get_user_by_email(email)
+        logger_firestore.info(f"Found UID {user.uid} for email {email}")
+        return user.uid
+    except auth.UserNotFoundError:
+        # This specific exception seems correct, keep it.
+        logger_firestore.warning(f"Firebase Auth: User not found for email: {email}")
+        return None
+    except Exception as e: # <--- CATCH ANY OTHER EXCEPTION HERE
+        # Log the specific type of error that occurred and the message
+        logger_firestore.error(
+            f"Error looking up email {email}. Type: {type(e).__name__}, Error: {e}",
+            exc_info=True # Include traceback in logs
+        )
+        return None
