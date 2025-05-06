@@ -117,10 +117,16 @@ class ETLRequest(BaseModel):
 class ColumnInfo(BaseModel): name: str; type: str; mode: str
 class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
 class SchemaResponse(BaseModel): dataset_id: str; tables: List[TableSchema]
+# +++ MODIFICATION START: Enhance NLQueryRequest +++
 class NLQueryRequest(BaseModel):
     prompt: str = Field(...)
     dataset_id: str = Field(..., description="The BigQuery dataset ID to query against.")
-    table_prefix: Optional[str] = Field(None, description="Optional prefix to filter tables shown to the AI (e.g., 'sales_').") # Added for context filtering
+    ai_mode: str = Field(default="AUTO", description="AI schema focus mode: AUTO or SEMI_AUTO.")
+    selected_tables: Optional[List[str]] = Field(None, description="Tables to focus on in SEMI_AUTO mode.")
+    selected_columns: Optional[List[str]] = Field(None, description="Columns to focus on in SEMI_AUTO mode (within selected_tables).")
+    # Keep table_prefix if you still want it for AUTO mode or as a fallback
+    table_prefix: Optional[str] = Field(None, description="Optional prefix to filter tables shown to the AI (used in AUTO mode or SEMI_AUTO without table selection).")
+# +++ MODIFICATION END +++
 class NLQueryResponse(BaseModel): generated_sql: Optional[str] = None; error: Optional[str] = None
 
 class UserProfileResponse(BaseModel):
@@ -265,56 +271,155 @@ async def natural_language_to_sql(
 
     # logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prefix: '{req.table_prefix or 'None'}'. Prompt: {req.prompt[:100]}...")
 
+# Inside natural_language_to_sql function
+
+    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Mode: {req.ai_mode}.")
+    if req.ai_mode == "SEMI_AUTO":
+        logger_api.info(f"  Selected Tables: {req.selected_tables}")
+        logger_api.info(f"  Selected Columns: {req.selected_columns}")
+
     try:
         # 1. Fetch the *full* schema for the dataset first
-        all_table_schemas = await get_dataset_schema(req.dataset_id, bq_client)
-        if not all_table_schemas: raise HTTPException(404, f"No schema found for {req.dataset_id}.")
-        # all_table_schemas = get_dataset_schema(req.dataset_id)
-        # if not all_table_schemas:
-        #      raise HTTPException(404, f"No tables/schema found for dataset {req.dataset_id}.")
+        all_table_schemas_full = await get_dataset_schema(req.dataset_id, bq_client)
+        if not all_table_schemas_full:
+            raise HTTPException(404, f"No schema found or dataset empty: {req.dataset_id}.")
 
-        # 2. Filter the schema based on the provided prefix (if any)
-        filtered_table_schemas = all_table_schemas
-        if req.table_prefix and req.table_prefix.strip():
-            prefix = req.table_prefix.strip()
-            filtered_table_schemas = [
-                ts for ts in all_table_schemas if ts.table_id.startswith(prefix)
-            ]
-            logger_api.info(f"Filtered schema from {len(all_table_schemas)} to {len(filtered_table_schemas)} tables using prefix '{prefix}'.")
-            if not filtered_table_schemas:
-                 # It's possible the prefix filters out everything
-                 raise HTTPException(404, f"No tables found in dataset {req.dataset_id} matching prefix '{prefix}'.")
-        else:
-             logger_api.info(f"No table prefix provided or empty, using schema for all {len(all_table_schemas)} tables.")
+        import copy
+        all_table_schemas = copy.deepcopy(all_table_schemas_full)
+
+        # 2. Determine the schema to send to the AI based on mode
+        schema_to_use: List[TableSchema] = []
+        schema_source_description = "all tables" # For logging/prompt
+
+# --- START: Corrected SEMI_AUTO Logic Block ---
+        if req.ai_mode == "SEMI_AUTO":
+            if not req.selected_tables:
+                logger_api.warning("SEMI_AUTO mode selected but no tables provided.")
+                raise HTTPException(400, "SEMI_AUTO mode requires at least one table to be selected.")
+
+            # 1. --- Filter by selected tables FIRST ---
+            selected_tables_set = set(req.selected_tables) # Use set for efficiency
+            schema_to_use = [ts for ts in all_table_schemas if ts.table_id in selected_tables_set]
+            schema_source_description = f"selected tables ({len(schema_to_use)}): {', '.join(req.selected_tables)}"
+            logger_api.info(f"SEMI_AUTO: Filtered to {len(schema_to_use)} tables based on selection.")
+
+            # Check if any tables were actually found before proceeding
+            if not schema_to_use:
+                 logger_api.warning(f"SEMI_AUTO: No tables found matching the selection: {req.selected_tables}")
+                 raise HTTPException(400, "None of the selected tables were found in the dataset schema.")
+
+            # 2. --- THEN, filter columns within the selected tables (if columns are provided) ---
+            if req.selected_columns:
+                filtered_schema_with_cols: List[TableSchema] = []
+                selected_columns_set = set(req.selected_columns)
+                logger_api.debug(f"SEMI_AUTO: Filtering columns within selected tables against: {selected_columns_set}")
+
+                # Now iterate through the *already table-filtered* schema_to_use list
+                for ts in schema_to_use:
+                    original_column_count = len(ts.columns)
+                    original_column_names = {c.name for c in ts.columns}
+
+                    # Filter columns for this specific table
+                    ts.columns = [c for c in ts.columns if c.name in selected_columns_set]
+                    kept_column_names = {c.name for c in ts.columns}
+
+                    logger_api.info(f"  Table '{ts.table_id}': Kept columns after filtering: {list(kept_column_names)}")
+                    # Optional: Log dropped columns
+                    # dropped_column_names = original_column_names - kept_column_names
+                    # if dropped_column_names:
+                    #     logger_api.debug(f"    (Dropped columns for this table: {list(dropped_column_names)})")
 
 
-        # 3. Build the schema string *from the filtered list*
-        schema_string = "\n".join([
-            f"Table: {ts.table_id} (Columns: {', '.join([f'{c.name} {c.type}' for c in ts.columns])})"
-            for ts in filtered_table_schemas # Use the filtered list here
-        ])
-        full_dataset_id_str = f"{req.dataset_id}" # For use in table names
+                    # Keep the table in the final list ONLY if it still has columns after filtering
+                    if ts.columns:
+                        filtered_schema_with_cols.append(ts)
+                    else:
+                        logger_api.info(f"  Table '{ts.table_id}': Removed as no selected columns remained after filtering.")
+
+                # Update schema_to_use with the column-filtered list
+                schema_to_use = filtered_schema_with_cols
+                schema_source_description += f", focusing on columns: {', '.join(req.selected_columns)}"
+                logger_api.info(f"SEMI_AUTO: Further filtered based on {len(req.selected_columns)} selected columns. Remaining tables with columns: {len(schema_to_use)}")
+
+            # 3. --- Final check for SEMI_AUTO: Ensure some schema remains AFTER all filtering ---
+            if not schema_to_use:
+                logger_api.warning("SEMI_AUTO mode resulted in an empty schema after all filtering (tables and columns).")
+                # Provide a more specific error message
+                error_detail = "The combination of selected tables and columns resulted in an empty schema. Ensure selected columns exist within the selected tables."
+                raise HTTPException(400, error_detail)
+# --- END: Corrected SEMI_AUTO Logic Block ---
+
+        else: # AUTO Mode (or default if mode is invalid)
+            # ... (AUTO mode logic remains the same) ...
+            schema_to_use = all_table_schemas
+            if req.table_prefix and req.table_prefix.strip():
+                 prefix = req.table_prefix.strip()
+                 original_count = len(schema_to_use) # Get count before filtering
+                 schema_to_use = [ts for ts in schema_to_use if ts.table_id.startswith(prefix)]
+                 schema_source_description = f"tables matching prefix '{prefix}' ({len(schema_to_use)}/{original_count})"
+                 logger_api.info(f"AUTO: Filtered schema from {original_count} to {len(schema_to_use)} tables using prefix '{prefix}'.")
+                 if not schema_to_use:
+                    raise HTTPException(404, f"No tables found in dataset {req.dataset_id} matching prefix '{prefix}'.")
+            else:
+                 logger_api.info(f"AUTO: Using schema for all {len(schema_to_use)} tables (no prefix).")
+
+        # --- Continue with building schema_string, prompt_template, calling AI, etc. ---
+        # ...
+
+    # ... (Continue to schema string building) ...
+
+
+        # --- START: Refactored Schema String Generation ---
+        # 3. Build the schema string *from the determined schema_to_use list*
+        # Make the table.column relationship explicit for the AI
+        schema_lines = []
+        for ts in schema_to_use:
+            if ts.columns: # Only include tables that still have columns
+                column_names = ', '.join([f"`{c.name}`" for c in ts.columns]) # Get column names, optionally add backticks
+                schema_lines.append(f"`{ts.table_id}` has {column_names} only")
+            # No need for an else clause, as we already filter empty tables
+
+        schema_string = "\n".join(schema_lines).strip()
+        # --- END: Refactored Schema String Generation ---
+
+        full_dataset_id_str = f"`{req.dataset_id}`" # Use backticks for dataset ID too
+
+        if not schema_string: # Should be caught earlier, but double-check
+            logger_api.error("Schema string is empty before sending to AI. This should not happen.")
+            raise HTTPException(500, "Internal error: Failed to prepare schema for AI.")
+
 
         # 4. Construct the AI Prompt (using the potentially filtered schema)
+                # 4. Construct the AI Prompt (using the refined schema string)
+        # --- START: Modified Prompt Template ---
+        logger_api.info(f"OOOOOOOOOOOO {schema_string}")
         prompt_template = f"""You are an expert BigQuery SQL generator. Generate a *single*, valid, executable BigQuery SQL query based on the user request and the provided database schema subset.
 
-Database Schema (Dataset ID: {req.dataset_id}):
+Database Schema (Dataset ID: {full_dataset_id_str}) - Use ONLY these tables and their specific columns as listed:
 {schema_string}
 
 User Request: "{req.prompt}"
 
 Instructions:
 1.  **Query Type:** Generate ONLY a valid BigQuery `SELECT` query. Do not generate DML or DDL.
-2.  **Table/Column Mapping (CRITICAL):** Analyze the User Request carefully for mentions of table or column concepts. Map approximate mentions (e.g., "approval deck", "payment amount") to the *exact* schema names provided (e.g., "APPROVAL_DECK", "Amount"). Consider variations in casing, spacing, and underscores. If ambiguous, use context. ONLY use tables and columns listed in the schema above.
-3.  **Table Qualification:** ALWAYS fully qualify table names as `{full_dataset_id_str}`.`YourTableName`. Use backticks `` ` `` around the fully qualified name: `{full_dataset_id_str}.\`YourTableName\``.
-4.  **Column Qualification:** Use table aliases and qualify column names (e.g., `t1.colA`) if joining multiple tables.
-5.  **Syntax:** Use correct BigQuery Standard SQL. Use backticks `` ` `` around table and column names ONLY if they contain special characters or are reserved keywords. Prefer schema names directly if valid.
-6.  **Assumptions:** Make reasonable assumptions if inferable from schema. If impossible, return a SQL comment like `-- Cannot fulfill request: Reason.`. Do NOT ask questions.
+2.  **Table/Column Mapping & Ownership (CRITICAL):**
+    *   Analyze the User Request for concepts mapping to the schema.
+    *   Map mentions (e.g., "employee salary", "department name") to the *exact* table and column names provided in the schema above (e.g., `Master_Data_Employee_Records`.`Salary`, `Master_Data_Status_Department`.`Department`).
+    *   **Crucially, each column name listed belongs ONLY to the specific table it appears under in the schema section.** Do not assume a column exists in a table if it's not explicitly listed for that table above.
+    *   ONLY use tables and columns listed in the schema.
+3.  **Table Qualification:** ALWAYS fully qualify table names, including the dataset ID: {full_dataset_id_str}.`YourTableName`. Use backticks `` ` `` around the fully qualified name (e.g., {full_dataset_id_str}.`Master_Data_Employee_Records`).
+4.  **Column Qualification:** Use table aliases (e.g., `t1`) and qualify column names (e.g., `t1`.`Salary`) especially when joining. Ensure qualified columns match the table ownership defined in the schema (e.g., use `t1`.`Salary` only if `t1` aliases `Master_Data_Employee_Records`).
+5.  **Syntax:** Use correct BigQuery Standard SQL syntax. Use backticks `` ` `` around table and column names if necessary (e.g., special characters, reserved words), but prefer direct names if valid.
+6.  **Assumptions:** Make reasonable assumptions ONLY if inferable from the provided schema and request. If the request cannot be fulfilled with the given schema, return ONLY a SQL comment explaining why (e.g., `-- Cannot fulfill request: The 'Budget' column is not available in the 'Master_Data_Status_Department' table according to the provided schema.`). Do NOT ask clarifying questions.
 7.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
 
 Generated BigQuery SQL Query:
 """
-        logger_api.debug(f"Gemini Prompt (Filtered Schema: {'Yes' if req.table_prefix else 'No'}):\n{prompt_template}")
+        # --- END: Modified Prompt Template ---
+
+        logger_api.debug(f"Gemini Prompt (Mode: {req.ai_mode}, Schema Source: {schema_source_description}):\n{schema_string[:500]}...") # Log schema sample
+
+        # ... (rest of the function: call Gemini, process response) ...
 
         # 5. Call Gemini API (Unchanged)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
