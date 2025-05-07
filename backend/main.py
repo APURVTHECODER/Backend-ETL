@@ -1427,6 +1427,72 @@ JSON Array of Suggestions:
         return PromptSuggestionResponse(suggestions=[], error="Failed to generate suggestions.")
 # +++ END NEW ENDPOINT: Create Dataset +++
 
+@bq_router.delete(
+    "/datasets/{dataset_id_only}/tables/{table_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["BigQuery", "Admin"], # Add Admin tag maybe
+    summary="Delete a specific BigQuery Table (Admin Only)",
+    description="Permanently deletes a specific table within a dataset. Requires administrator privileges.",
+    dependencies=[Depends(require_admin)], # Apply RBAC
+    responses={
+        204: {"description": "Table deleted successfully"},
+        403: {"description": "Permission denied: Admin role required"},
+        404: {"description": "Dataset or Table not found"},
+        500: {"description": "Internal server error"},
+        502: {"description": "Error communicating with BigQuery API"},
+        503: {"description": "BigQuery service unavailable"}
+    }
+)
+async def delete_bigquery_table(
+    dataset_id_only: str = Path(..., description="The ID of the dataset (workspace name only, e.g., 'MVP').", example="MVP"),
+    table_id: str = Path(..., description="The ID of the table to delete.", example="Master_Data_Employee_Records_backup"),
+    admin_user: dict = Depends(require_admin), # Get admin user data for logging
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    """
+    Deletes an existing BigQuery table within a specified dataset. (Admin Only)
+    Requires the requesting user to have the 'admin' role stored in Firestore.
+    """
+    admin_uid = admin_user.get("uid", "unknown_admin")
+    if not API_GCP_PROJECT:
+        logger_api.error(f"Admin {admin_uid}: Cannot delete table '{table_id}' in dataset '{dataset_id_only}': GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+
+    # Construct the full table ID: project.dataset.table
+    full_table_id = f"{API_GCP_PROJECT}.{dataset_id_only}.{table_id}"
+    logger_api.warning(f"ADMIN ACTION by UID {admin_uid}: Attempting to DELETE table: {full_table_id}")
+
+    try:
+        # Delete the table.
+        # not_found_ok=False: Raises NotFound exception if the table doesn't exist.
+        bq_client.delete_table(full_table_id, not_found_ok=False)
+
+        logger_api.info(f"Admin {admin_uid}: Successfully deleted table: {full_table_id}")
+        # Return HTTP 204 No Content on success
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    except NotFound:
+        logger_api.warning(f"Admin {admin_uid}: Table or dataset not found during delete attempt: {full_table_id}")
+        # Check if dataset exists to give slightly better error
+        try:
+            bq_client.get_dataset(f"{API_GCP_PROJECT}.{dataset_id_only}")
+            # If dataset exists, the table must be missing
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table '{table_id}' not found in dataset '{dataset_id_only}'.")
+        except NotFound:
+             # Dataset itself is missing
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dataset '{dataset_id_only}' not found.")
+        except Exception as ds_check_err: # Catch errors during dataset check
+             logger_api.error(f"Error checking dataset existence during table delete for {full_table_id}: {ds_check_err}")
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table '{table_id}' or Dataset '{dataset_id_only}' not found (verification error).")
+
+    except GoogleAPICallError as e:
+        # Catch specific BQ API errors (e.g., permission issues on the *service account*)
+        logger_api.error(f"Admin {admin_uid}: Google API Call Error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API during table deletion: {str(e)}")
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger_api.error(f"Admin {admin_uid}: Unexpected error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during table deletion: {str(e)}")
 # ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
 
 # --- Include Routers ---
