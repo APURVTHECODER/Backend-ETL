@@ -436,7 +436,12 @@ Each table lists its columns with their data types in parentheses (e.g., `column
 7.  **Syntax:** Use correct BigQuery Standard SQL syntax.
 8.  **Assumptions:** Make reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions.
 9.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
-
+10.  **Date Handling (VERY IMPORTANT):**
+    *   The schema contains DATE and TIMESTAMP columns. These require specific formatting and comparison techniques in SQL WHERE clauses.
+    *   **Comparing with DATE Columns:** If the User Request includes a date (e.g., "after 15-03-2024", "on 2024/03/15"), convert it to the standard 'YYYY-MM-DD' format and use `DATE('YYYY-MM-DD')` for comparisons (e.g., `WHERE date_col > DATE('2024-03-15')`).
+    *   **Comparing TIMESTAMPs as Dates:** When comparing a column with a TIMESTAMP type (like `HireDate` or `EndDate`) against a specific date provided by the user (e.g., "hired before 2023-01-01", "ended on 10-05-2024"), **extract the date part from the TIMESTAMP column** using the `DATE()` function before comparing. Example: Instead of `t2.EndDate >= DATE '2024-01-01'`, generate `DATE(t2.EndDate) >= DATE '2024-01-01'`. This correctly compares just the date portion.
+    *   **Comparing with TIMESTAMP Columns (Specific Time):** Only use full `TIMESTAMP('YYYY-MM-DD HH:MM:SS')` comparisons or `TIMESTAMP_TRUNC` if the user explicitly mentions a specific time or uses terms implying time precision (e.g., "after 2 PM", "since midnight yesterday"). Otherwise, prefer the `DATE()` extraction method above for date-level comparisons.
+    *   **Relative Dates:** Interpret relative dates like "yesterday", "last week", "last month" using appropriate BigQuery date/timestamp functions based on the current date (assume today is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}). Remember to apply the `DATE(...)` extraction if comparing the result against a TIMESTAMP column for just the date part.
 Generated BigQuery SQL Query:
 """
         # --- END: Modified Prompt Template ---
