@@ -415,6 +415,7 @@ Each table lists its columns with their data types in parentheses (e.g., `column
 **User Request:** "{req.prompt}"
 
 **Instructions:**
+0.  **Data Types** Handle Datatypes Yourself.
 1.  **Query Type:** Generate ONLY a valid BigQuery `SELECT` query. Do not generate DML or DDL.
 2.  **STRICT Schema Adherence & Column Ownership (CRITICAL):**
     *   The *only* valid tables, columns, and data types you can use are those explicitly listed in the "Database Schema" section above.
