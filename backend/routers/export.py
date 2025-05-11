@@ -12,6 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status # Import
 from pydantic import BaseModel, Field
 from google.cloud import bigquery # Keep for type hints
 from google.api_core.exceptions import GoogleAPICallError, NotFound, Forbidden
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from openpyxl.utils.dataframe import dataframe_to_rows
+from datetime import datetime, date, time, timezone # Added timezone
+import base64
+from fastapi.responses import StreamingResponse
+from openpyxl.styles import Font
 
 # --- Import Config Variables ---
 # Import only specific variables needed from config
@@ -35,7 +42,19 @@ export_router = APIRouter(
     tags=["Export"],
     dependencies=[Depends(verify_token)] # Apply authentication to all export routes
 )
+class ChartConfig(BaseModel):
+    type: str
+    x_axis: str
+    y_axes: List[str]
+    rationale: Optional[str] = None
 
+class QueryToExcelRequest(BaseModel):
+    job_id: str
+    sql: str
+    location: str
+    chart_image_base64: Optional[str] = Field(None) # No '...' default for Optional
+    chart_config: Optional[ChartConfig] = Field(None)
+    chart_data: Optional[List[Dict[str, Any]]] = Field(None)
 # --- Pydantic Models ---
 class QueryExportRequest(BaseModel):
     sql: str = Field(..., description="The SQL query that was executed.")
@@ -148,11 +167,11 @@ def make_datetime_naive(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# --- API Endpoint ---
+# --- API Endpoint (MODIFIED) ---
 @export_router.post("/query-to-excel",
-                    response_class=Response, # Allows returning raw bytes
-                    summary="Export Query Results to Excel",
-                    description="Exports the results of a completed BigQuery job, the original SQL query, and a preview of source tables mentioned in the query to an Excel file with multiple sheets.",
+                    response_class=Response,
+                    summary="Export Query Results, SQL, Source Previews, and Optional Chart to Excel",
+                    description="Exports various data components related to a BigQuery job to an Excel file.",
                     responses={
                         200: {
                             "description": "Excel file generated successfully.",
@@ -160,157 +179,234 @@ def make_datetime_naive(df: pd.DataFrame) -> pd.DataFrame:
                                 "schema": {"type": "string", "format": "binary"}
                             }}
                         },
-                        400: {"description": "Invalid request (e.g., Job not done, Job failed)"},
-                        404: {"description": "Job ID not found."},
-                        500: {"description": "Internal server error during export generation."},
-                        503: {"description": "BigQuery service unavailable."},
+                        # ... other responses
                     })
-async def export_query_to_excel(
-    req: QueryExportRequest,
-    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject BigQuery client
+async def export_query_to_excel( # Renamed to match your previous working one
+    payload: QueryToExcelRequest, # Use the Pydantic model that includes chart fields
+    bq_client: bigquery.Client = Depends(get_bigquery_client)
 ):
-    """
-    Exports the result of a BigQuery job, the original SQL, and previews
-    of source tables to an Excel file.
-    """
-    logger_export.info(f"Received Excel export request for Job ID: {req.job_id}, SQL: {req.sql[:60]}...")
+    logger_export.info(f"Received Excel export request for Job ID: {payload.job_id}. Chart included: {'Yes' if payload.chart_image_base64 else 'No'}")
 
-    # Use the injected BigQuery client
-    if not bq_client: # Defensive check, although Depends should handle it
+    if not bq_client:
          logger_export.error("Export Endpoint: BigQuery client is None via dependency.")
          raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery client dependency failed.")
 
     try:
-        # 1. Fetch Job Results using injected client
-        logger_export.info(f"Fetching results for job {req.job_id} in location {req.location}...")
+        # 1. Fetch Job Results
+        logger_export.info(f"Fetching results for job {payload.job_id} in location {payload.location}...")
         try:
-            job = bq_client.get_job(req.job_id, location=req.location)
+            job = bq_client.get_job(payload.job_id, location=payload.location)
         except NotFound:
-             logger_export.warning(f"Job ID {req.job_id} not found in location {req.location}.")
-             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job ID '{req.job_id}' not found.")
+             logger_export.warning(f"Job ID {payload.job_id} not found in location {payload.location}.")
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job ID '{payload.job_id}' not found.")
 
         if job.state != 'DONE':
-            logger_export.warning(f"Job {req.job_id} is not complete (State: {job.state}). Cannot export.")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {req.job_id} not complete (State: {job.state}).")
+            logger_export.warning(f"Job {payload.job_id} is not complete (State: {job.state}). Cannot export.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} not complete.")
         if job.error_result:
             err_msg = job.error_result.get('message', 'Unknown error')
-            logger_export.warning(f"Job {req.job_id} failed: {err_msg}. Cannot export.")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {req.job_id} failed: {err_msg}")
+            logger_export.warning(f"Job {payload.job_id} failed: {err_msg}. Cannot export.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} failed.")
 
         results_df: pd.DataFrame
+        result_rows_data_for_excel: List[List[Any]] = [] # For openpyxl direct write
+        result_schema_for_excel: List[str] = []
+
+
         if not job.destination:
-            logger_export.info(f"Job {req.job_id} did not produce a destination table (e.g., DML). Creating info sheet.")
-            results_df = pd.DataFrame([{"message": "Query did not produce a standard result table (e.g., DML or script)."}])
+            logger_export.info(f"Job {payload.job_id} had no destination (e.g., DML). Creating info df.")
+            # For consistency, we'll still aim to use openpyxl directly later
+            result_schema_for_excel = ["Information"]
+            result_rows_data_for_excel.append([f"Query (Job ID: {job.job_id}) did not produce a standard result table."])
+            if job.statement_type:
+                result_rows_data_for_excel.append([f"Statement Type: {job.statement_type}"])
+            if hasattr(job, 'num_dml_affected_rows') and job.num_dml_affected_rows is not None:
+                result_rows_data_for_excel.append([f"Rows Affected: {job.num_dml_affected_rows}"])
         else:
-             # Fetch all rows from the destination table for the export
-             # Consider adding limits or warnings for extremely large result sets if necessary
-            logger_export.info(f"Fetching ALL rows from destination table for job {req.job_id}...")
-            rows_iterator = bq_client.list_rows(job.destination)
-            results_df = rows_iterator.to_dataframe()
-            logger_export.info(f"Fetched {len(results_df)} result rows for job {req.job_id}.")
+            logger_export.info(f"Fetching ALL rows from destination table for job {payload.job_id}...")
+            rows_iterator = bq_client.list_rows(job.destination, timeout=300) # Timeout for list_rows
+            
+            if rows_iterator.schema:
+                result_schema_for_excel = [field.name for field in rows_iterator.schema]
+            
+            for row_data in rows_iterator:
+                serialized_values = []
+                for field_name in result_schema_for_excel: # Iterate based on schema order
+                    value = row_data[field_name]
+                    if isinstance(value, bytes):
+                        try: serialized_values.append(value.decode('utf-8'))
+                        except UnicodeDecodeError: serialized_values.append(f"0x{value.hex()}")
+                    elif isinstance(value, (datetime, pd.Timestamp)):
+                        # Excel handles datetimes best if they are naive or UTC Python datetimes
+                        if value.tzinfo is not None:
+                            value = value.astimezone(timezone.utc).replace(tzinfo=None) # Convert to naive UTC
+                        serialized_values.append(value) # Pass Python datetime object
+                    elif isinstance(value, date):
+                        serialized_values.append(value) # Pass Python date object
+                    elif isinstance(value, time):
+                         # openpyxl might not handle time objects well directly without date.
+                         # Convert to string or datetime with dummy date.
+                        serialized_values.append(value.isoformat())
+                    elif isinstance(value, list) or isinstance(value, dict):
+                        serialized_values.append(json.dumps(value, default=str))
+                    else:
+                        serialized_values.append(value)
+                result_rows_data_for_excel.append(serialized_values)
+            logger_export.info(f"Fetched {len(result_rows_data_for_excel)} result rows for job {payload.job_id}.")
 
-        # 2. Extract Source Tables from the original SQL
-        source_tables = extract_fully_qualified_tables(req.sql)
+        # Create Workbook
+        workbook = Workbook()
+        
+        # --- Sheet 1: Main Query Results ---
+        results_sheet = workbook.active
+        results_sheet.title = "Query Results"
+        if result_schema_for_excel:
+            results_sheet.append(result_schema_for_excel) # Add headers
+        for row_values in result_rows_data_for_excel:
+            results_sheet.append(row_values) # Add data rows
+        logger_export.info(f"Main query results written to Excel sheet 'Query Results'.")
 
-        # 3. Fetch Source Table Previews (pass injected client to helper)
-        source_data_frames: Dict[str, pd.DataFrame] = {}
-        processed_sheet_names: Set[str] = set() # To handle potential duplicate base names
+        # --- Sheet 2: Original SQL Query ---
+        # query_sheet = workbook.create_sheet(title="SQL Query")
+        # query_sheet.cell(row=1, column=1, value="Executed SQL Query:")
+        # query_sheet.cell(row=2, column=1, value=payload.sql)
+        # # Optional: Auto-adjust column width for SQL
+        # query_sheet.column_dimensions['A'].width = 80 
+        # logger_export.info("SQL query written to Excel sheet 'SQL Query'.")
+
+        # --- Sheets 3+: Source Table Previews ---
+        source_tables = extract_fully_qualified_tables(payload.sql)
+        processed_sheet_names: Set[str] = set(["Query Results"]) 
 
         for table_fqn in source_tables:
-            # Skip INFORMATION_SCHEMA tables as they are usually not needed for data context
             if 'information_schema' in table_fqn.lower():
                  logger_export.info(f"Skipping fetch for INFORMATION_SCHEMA table: {table_fqn}")
                  continue
 
             logger_export.info(f"Fetching preview for source table: {table_fqn} (Limit: {MAX_SOURCE_TABLE_ROWS})")
-            # Construct the preview query
-            query = f"SELECT * FROM `{table_fqn}` LIMIT {MAX_SOURCE_TABLE_ROWS}"
+            preview_query = f"SELECT * FROM `{table_fqn}` LIMIT {MAX_SOURCE_TABLE_ROWS}"
+            
+            df_source_preview = await fetch_bq_data_to_dataframe(preview_query, payload.location, bq_client)
+            df_source_preview_naive = make_datetime_naive(df_source_preview.copy()) # Ensure naive datetimes
+
+            base_table_name = table_fqn.split('.')[-1]
+            sanitized_base_name = re.sub(r'[\\/*?:\[\]]', '_', base_table_name)[:25]
+            
+            sheet_title_prefix = "Source_"
+            if 'error' in df_source_preview_naive.columns and len(df_source_preview_naive) == 1:
+                sheet_title_prefix = "Error_Source_"
+
+            sheet_name_candidate = f"{sheet_title_prefix}{sanitized_base_name}"
+            final_sheet_name = sheet_name_candidate
+            count = 1
+            while final_sheet_name.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names): # Excel limit is 31
+                suffix = f"_{count}"
+                final_sheet_name = f"{sheet_name_candidate[:31-len(suffix)]}{suffix}"
+                count += 1
+                if count > 99: # Safety break
+                    final_sheet_name = f"{sheet_title_prefix}Table_{uuid.uuid4().hex[:8]}" # Ensure unique
+                    break
+            
+            final_sheet_name = final_sheet_name[:31] # Enforce 31 char limit strictly
+            
+            source_sheet = workbook.create_sheet(title=final_sheet_name)
+            for r_idx, row in enumerate(dataframe_to_rows(df_source_preview_naive, index=False, header=True), 1):
+                for c_idx, value in enumerate(row, 1):
+                    source_sheet.cell(row=r_idx, column=c_idx, value=value)
+            processed_sheet_names.add(final_sheet_name)
+            logger_export.info(f"Source table preview '{table_fqn}' written to sheet '{final_sheet_name}'.")
+
+        # --- Sheet N+1: Chart Image and Info (if provided) ---
+        if payload.chart_image_base64 and payload.chart_config:
+            chart_title = f"{payload.chart_config.type.capitalize()} Chart"
+            # Ensure unique sheet name for chart
+            unique_chart_sheet_title = chart_title
+            count = 1
+            while unique_chart_sheet_title.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names):
+                suffix = f"_{count}"
+                unique_chart_sheet_title = f"{chart_title[:31-len(suffix)]}{suffix}"
+                count +=1
+            unique_chart_sheet_title = unique_chart_sheet_title[:31]
+
+            chart_info_sheet = workbook.create_sheet(title=unique_chart_sheet_title)
+            processed_sheet_names.add(unique_chart_sheet_title)
+            img_row_idx = 1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="Chart Type:").font = Font(bold=True)
+            chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.type)
+            img_row_idx += 1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="X-Axis:").font = Font(bold=True)
+            chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.x_axis)
+            img_row_idx += 1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="Y-Axes:").font = Font(bold=True)
+            chart_info_sheet.cell(row=img_row_idx, column=2, value=", ".join(payload.chart_config.y_axes))
+            img_row_idx +=1
+            if payload.chart_config.rationale:
+                 chart_info_sheet.cell(row=img_row_idx, column=1, value="Rationale:").font = Font(bold=True)
+                 chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.rationale)
+                 img_row_idx +=1
+            img_row_idx +=1 
+
             try:
-                # Pass the injected bq_client to the helper function
-                df = await fetch_bq_data_to_dataframe(query, req.location, bq_client)
+                image_data = base64.b64decode(payload.chart_image_base64)
+                image_stream = io.BytesIO(image_data)
+                img = OpenpyxlImage(image_stream)
+                chart_info_sheet.add_image(img, f"A{img_row_idx}")
+                logger_export.info(f"Chart image added to '{unique_chart_sheet_title}' sheet.")
+            except ImportError: # Specifically if Pillow is missing
+                logger_export.error("Pillow library not installed. Cannot embed chart image.")
+                chart_info_sheet.cell(row=img_row_idx, column=1, value="[Error: Pillow library not installed. Chart image cannot be embedded.]")
+            except Exception as img_e:
+                logger_export.error(f"Failed to decode or add image to Excel: {img_e}", exc_info=True)
+                chart_info_sheet.cell(row=img_row_idx, column=1, value=f"[Error embedding chart image: {str(img_e)}]")
 
-                # Sanitize sheet name (Excel limits sheet names to 31 chars and restricts chars)
-                base_table_name = table_fqn.split('.')[-1] # Get last part
-                sanitized_base_name = re.sub(r'[\\/*?:\[\]]', '_', base_table_name)[:25] # Limit length early
-                sheet_name = sanitized_base_name
-                count = 1
-                # Ensure unique sheet name (case-insensitive check)
-                while sheet_name.lower() in (name.lower() for name in processed_sheet_names):
-                    sheet_name = f"{sanitized_base_name[:28-len(str(count))]}_{count}" # Adjust length limit
-                    count += 1
-                    if count > 99: # Safety break
-                         sheet_name = f"Source_{count}" # Fallback if name conflict persists
+        # --- Sheet N+2: Raw Chart Data (if chart was provided) ---
+        if payload.chart_data and payload.chart_image_base64: 
+            chart_data_title = "Chart Source Data"
+            unique_chart_data_sheet_title = chart_data_title
+            count = 1
+            while unique_chart_data_sheet_title.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names):
+                suffix = f"_{count}"
+                unique_chart_data_sheet_title = f"{chart_data_title[:31-len(suffix)]}{suffix}"
+                count +=1
+            unique_chart_data_sheet_title = unique_chart_data_sheet_title[:31]
+            
+            chart_data_sheet = workbook.create_sheet(title=unique_chart_data_sheet_title)
+            processed_sheet_names.add(unique_chart_data_sheet_title)
+            
+            df_chart = pd.DataFrame(payload.chart_data)
+            df_chart_naive = make_datetime_naive(df_chart.copy())
 
-                # Check if the DataFrame contains only an error message from the helper
-                is_error_df = 'error' in df.columns and 'query' in df.columns and len(df) == 1
-                final_sheet_name = f"Error_{sheet_name}" if is_error_df else f"Source_{sheet_name}"
+            for r_idx, row_val_list in enumerate(dataframe_to_rows(df_chart_naive, index=False, header=True), 1):
+                for c_idx, value in enumerate(row_val_list, 1):
+                    chart_data_sheet.cell(row=r_idx, column=c_idx, value=value)
+            logger_export.info(f"Chart source data ({len(df_chart_naive)} rows) added to '{unique_chart_data_sheet_title}' sheet.")
 
-                # Ensure final sheet name is unique too (should be due to prefix/count, but double check)
-                final_unique_sheet_name = final_sheet_name
-                final_count = 1
-                while final_unique_sheet_name.lower() in (name.lower() for name in processed_sheet_names):
-                    final_unique_sheet_name = f"{final_sheet_name[:28-len(str(final_count))]}_{final_count}"
-                    final_count += 1
 
-                source_data_frames[final_unique_sheet_name] = df
-                processed_sheet_names.add(final_unique_sheet_name)
-
-            except Exception as e:
-                 # Catch unexpected errors within the loop itself
-                 logger_export.error(f"Unexpected error during source table fetch loop for {table_fqn}: {e}", exc_info=True)
-                 error_sheet_name = f"LoopError_{table_fqn.split('.')[-1][:18]}"
-                 # Ensure unique error sheet name
-                 err_count = 1
-                 while error_sheet_name.lower() in (name.lower() for name in processed_sheet_names):
-                    error_sheet_name = f"LoopError_{table_fqn.split('.')[-1][:18]}_{err_count}"
-                    err_count += 1
-                 source_data_frames[error_sheet_name] = pd.DataFrame([{"error": f"Unexpected Error processing source table: {str(e)}"}])
-                 processed_sheet_names.add(error_sheet_name)
-
-        # 4. Create Excel File in Memory using openpyxl engine
-        logger_export.info("Creating Excel file in memory...")
+        # --- Save workbook to a BytesIO stream ---
         excel_buffer = io.BytesIO()
-        try:
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                # Write Results sheet (make datetimes naive first)
-                logger_export.debug("Writing 'Results' sheet...")
-                results_df_naive = make_datetime_naive(results_df.copy())
-                results_df_naive.to_excel(writer, sheet_name='Results', index=False)
+        workbook.save(excel_buffer)
+        excel_buffer.seek(0)
 
-                # Write Query sheet
-                logger_export.debug("Writing 'Query' sheet...")
-                pd.DataFrame({'SQL Query': [req.sql]}).to_excel(writer, sheet_name='Query', index=False)
-
-                # Write Source Table Preview sheets (make datetimes naive first)
-                for final_sheet_name, df_to_write in source_data_frames.items():
-                    logger_export.debug(f"Writing '{final_sheet_name}' sheet...")
-                    df_naive = make_datetime_naive(df_to_write.copy())
-                    df_naive.to_excel(writer, sheet_name=final_sheet_name, index=False)
-
-            excel_buffer.seek(0) # Rewind buffer to the beginning
-        except Exception as excel_error:
-            logger_export.error(f"Failed to write data to Excel buffer: {excel_error}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Failed to generate Excel file content: {str(excel_error)}")
-
-        # 5. Prepare and Return the Response
-        filename = f"query_export_{req.job_id[:8]}.xlsx" # Generate a filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"query_export_{payload.job_id[:8]}_{timestamp}.xlsx"
+        
         headers = {
             'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            # ExcelWriter with openpyxl automatically sets the correct MIME type for .xlsx
         }
         logger_export.info(f"Successfully generated Excel export: {filename}")
-        return Response(content=excel_buffer.getvalue(), headers=headers, media_type=headers['Content-Type'])
+        return StreamingResponse(
+            excel_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # Explicitly set
+            headers=headers
+        )
 
-    # --- Exception Handling for the main endpoint ---
     except HTTPException as http_exc:
-        # Re-raise HTTPExceptions (like 400, 404, 503 from checks)
         raise http_exc
     except GoogleAPICallError as e:
-        # Catch Google API errors not caught in helpers (e.g., initial get_job)
-        logger_export.error(f"Google API Error during export for job {req.job_id}: {e}", exc_info=True)
+        logger_export.error(f"Google API Error during export for job {payload.job_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with Google Cloud: {str(e)}")
     except Exception as e:
-        # Catch any other unexpected errors during the process
-        logger_export.error(f"Unexpected error during Excel export for job {req.job_id}: {e}", exc_info=True)
-        logger_export.error(traceback.format_exc()) # Log full traceback
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate export file due to an unexpected error.")
+        logger_export.error(f"Unexpected error during Excel export for job {payload.job_id}: {e}", exc_info=True)
+        logger_export.error(traceback.format_exc())
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate export file: {str(e)}")
