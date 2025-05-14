@@ -37,3 +37,4 @@ spec:
   tls: # This section tells the Ingress to enable TLS for the specified hosts
     - hosts:
         - thefrontmangames.com
+        - test99.thefrontmangames.com
