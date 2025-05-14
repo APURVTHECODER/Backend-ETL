@@ -5,6 +5,7 @@ metadata:
   annotations:
     kubernetes.io/ingress.global-static-ip-name: "etl-automation" # Your static IP NAME
     networking.gke.io/managed-certificates: "thefrontmangames-com-cert" # NAME of your ManagedCertificate
+    cert-manager.io/issue-temporary-certificate: "true"
     kubernetes.io/ingress.class: "gce"
     # Uncomment and set if you have a reserved static IP:
     # kubernetes.io/ingress.global-static-ip-name: "your-static-ip-name"
