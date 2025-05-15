@@ -8,6 +8,7 @@ metadata:
     # cert-manager.io/issue-temporary-certificate: "true"
     # acme.cert-manager.io/http01-edit-in-place: "true"
     kubernetes.io/ingress.class: "gce"
+    ingress.gcp.kubernetes.io/pre-shared-cert: "mcrt-484191be-39be-4ec0-a558-f774994dc498"
     # Uncomment and set if you have a reserved static IP:
     # kubernetes.io/ingress.global-static-ip-name: "your-static-ip-name"
     # Uncomment and set if using GKE ManagedCertificate for HTTPS:
@@ -19,7 +20,7 @@ spec:
       port:
         number: 80
   rules:
-    # - host: thefrontmangames.com
+    - host: thefrontmangames.com
     - http:
         paths:
           - path: /api
@@ -36,7 +37,7 @@ spec:
                 name: frontend-service    # All other traffic
                 port:
                   number: 80
-  # tls: # This section tells the Ingress to enable TLS for the specified hosts
-  #   - hosts:
-  #       - thefrontmangames.com
+  tls: # This section tells the Ingress to enable TLS for the specified hosts
+    - hosts:
+        - thefrontmangames.com
   #       - test99.thefrontmangames.com
