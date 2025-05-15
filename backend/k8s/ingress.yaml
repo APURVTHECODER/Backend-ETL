@@ -3,25 +3,18 @@ kind: Ingress
 metadata:
   name: app-ingress
   annotations:
-    # kubernetes.io/ingress.global-static-ip-name: "etl-automation" # Your static IP NAME
-    # networking.gke.io/managed-certificates: "thefrontmangames-com-cert" # NAME of your ManagedCertificate
-    # cert-manager.io/issue-temporary-certificate: "true"
-    # acme.cert-manager.io/http01-edit-in-place: "true"
     kubernetes.io/ingress.class: "gce"
     ingress.gcp.kubernetes.io/pre-shared-cert: "mcrt-484191be-39be-4ec0-a558-f774994dc498"
-    # Uncomment and set if you have a reserved static IP:
-    # kubernetes.io/ingress.global-static-ip-name: "your-static-ip-name"
-    # Uncomment and set if using GKE ManagedCertificate for HTTPS:
-    # networking.gke.io/managed-certificates: "your-managed-cert-name"
+    # Ensure other cert annotations like networking.gke.io/managed-certificates are commented out or removed
 spec:
   defaultBackend:
     service:
-      name: frontend-service    # Change or remove if no frontend
+      name: frontend-service
       port:
         number: 80
   rules:
-    - host: thefrontmangames.com
-    - http:
+    - host: thefrontmangames.com  # Define the host
+      http:                      # Paths and backends for THIS host
         paths:
           - path: /api
             pathType: Prefix
@@ -34,10 +27,10 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: frontend-service    # All other traffic
+                name: frontend-service
                 port:
                   number: 80
-  tls: # This section tells the Ingress to enable TLS for the specified hosts
+  tls:
     - hosts:
         - thefrontmangames.com
-  #       - test99.thefrontmangames.com
+      # No secretName needed here because you're using ingress.gcp.kubernetes.io/pre-shared-cert
