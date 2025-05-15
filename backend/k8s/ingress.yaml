@@ -1,20 +1,24 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: app-ingress
+  name: app-ingress-1 # Changed to match what you created
+  namespace: default
   annotations:
+    # kubernetes.io/ingress.class: "gce" # Old annotation
     kubernetes.io/ingress.class: "gce"
-    ingress.gcp.kubernetes.io/pre-shared-cert: "mcrt-484191be-39be-4ec0-a558-f774994dc498"
-    # Ensure other cert annotations like networking.gke.io/managed-certificates are commented out or removed
+    # ingress.gcp.kubernetes.io/pre-shared-cert: "mcrt-484191be-39be-4ec0-a558-f774994dc498" # <-- ADD THE CERTIFICATE ID HERE
+    # cert-manager.io/issue-temporary-certificate: "true"
+    # acme.cert-manager.io/http01-edit-in-place: "true"
 spec:
+  # ingressClassName: "gce" # New way to specify Ingress class
   defaultBackend:
     service:
       name: frontend-service
       port:
         number: 80
   rules:
-    - host: thefrontmangames.com  # Define the host
-      http:                      # Paths and backends for THIS host
+    # - host: thefrontmangames.com
+    - http:
         paths:
           - path: /api
             pathType: Prefix
@@ -30,7 +34,6 @@ spec:
                 name: frontend-service
                 port:
                   number: 80
-  tls:
-    - hosts:
-        - thefrontmangames.com
-      # No secretName needed here because you're using ingress.gcp.kubernetes.io/pre-shared-cert
+  # tls:
+  #   - hosts:
+  #       - thefrontmangames.com
