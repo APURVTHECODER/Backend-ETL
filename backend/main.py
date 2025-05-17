@@ -27,7 +27,7 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role # Import initializer
+from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access  # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
@@ -1128,26 +1128,31 @@ async def list_bigquery_datasets(
         if user_role == 'admin':
             logger_api.info(f"User {user_uid} is admin. Returning all {len(all_datasets_from_bq)} fetched datasets.")
             final_datasets_list = all_datasets_from_bq
-        else:
+# main.py - inside list_bigquery_datasets, before the filter
+# ...
+        else: # Not admin
             logger_api.info(f"User {user_uid} is not admin. Fetching accessible datasets from Firestore.")
             accessible_dataset_ids = await get_user_accessible_datasets(user_uid)
 
             if accessible_dataset_ids is None:
-                # Error fetching from Firestore or user not found
-                logger_api.warning(f"Could not determine accessible datasets for user {user_uid} (Firestore error or user not found). Returning empty list.")
+                logger_api.warning(f"Could not determine accessible datasets for user {user_uid}. Returning empty list.")
                 final_datasets_list = []
             elif not accessible_dataset_ids:
-                # User found, but no datasets assigned (empty list)
                 logger_api.info(f"User {user_uid} has no datasets assigned in Firestore. Returning empty list.")
                 final_datasets_list = []
             else:
-                # User found with specific datasets assigned - Filter the BQ list
-                logger_api.info(f"User {user_uid} has access to {len(accessible_dataset_ids)} specific datasets. Filtering BQ list.")
-                allowed_set = set(accessible_dataset_ids) # Use a set for faster lookups
+                logger_api.info(f"User {user_uid} has access to Firestore dataset IDs: {accessible_dataset_ids}") # Log raw accessible IDs
+                logger_api.info(f"BQ datasets fetched (short IDs): {[d.datasetId for d in all_datasets_from_bq]}") # Log BQ short IDs
+
+                allowed_set = set(accessible_dataset_ids)
                 final_datasets_list = [
-                    ds for ds in all_datasets_from_bq if ds.datasetId in allowed_set
+                        ds for ds in all_datasets_from_bq if ds.datasetId in allowed_set
                 ]
+                if not final_datasets_list and all_datasets_from_bq: # If filtering resulted in empty but there were BQ datasets
+                    logger_api.warning(f"FILTERING MISMATCH for user {user_uid}: BQ IDs: {[d.datasetId for d in all_datasets_from_bq]}, Firestore Allowed: {list(allowed_set)}")
+
                 logger_api.info(f"Filtered list size for user {user_uid}: {len(final_datasets_list)}")
+# ...
 
         # Sort alphabetically by datasetId before returning
         final_datasets_list.sort(key=lambda ds: ds.datasetId)
@@ -1208,135 +1213,182 @@ async def list_bigquery_datasets(
 # --- BigQuery API Endpoints (using bq_router) ---
 
 # ... (keep existing GET /datasets endpoint) ...
-
 @bq_router.post(
     "/datasets",
     response_model=DatasetCreatedResponse,
-    status_code=status.HTTP_201_CREATED, # Use status module
-    tags=["BigQuery"],
-    summary="Create a new BigQuery Dataset (Admin Only)",
-    description="Creates a new BigQuery dataset. Requires administrator privileges.",
-    # +++ Apply the RBAC dependency +++
-    dependencies=[Depends(require_admin)]
+    status_code=status.HTTP_201_CREATED,
+    tags=["BigQuery Workspaces"], # Renamed tag for clarity
+    summary="Create a new BigQuery Workspace (Dataset)",
+    description="Creates a new BigQuery workspace. Administrators can create multiple workspaces. Normal users are restricted to creating a single workspace to which they get automatic access.",
+    # Removed: dependencies=[Depends(require_admin)] # Role logic is now handled inside
 )
-async def create_bigquery_dataset(
+async def create_bigquery_workspace( # Renamed for clarity
     req: CreateDatasetRequest,
-    bq_client: bigquery.Client = Depends(get_bigquery_client), # Inject client
-    # user_data: dict = Depends(require_admin) # Already in router deps
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
+    user: dict = Depends(verify_token),
 ):
-    """
-    Creates a new BigQuery dataset. (Admin Only)
-    Requires the requesting user to have the 'admin' role stored in Firestore.
-    """
-    # if not api_bigquery_client:
-    #     logger_api.error("Cannot create dataset: BigQuery client not available.")
-    #     raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
+    user_uid = user.get("uid")
+    if not user_uid:
+        logger_api.error("User UID not found in token during workspace creation attempt.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication error: User ID not found.")
+
+    user_role = await get_user_role(user_uid)
+    logger_api.info(f"Workspace creation attempt by user '{user_uid}' (Role: '{user_role}') for workspace ID '{req.dataset_id}'.")
+
+    if user_role != 'admin':
+        # For non-admin users, check if they already have access to any workspace.
+        # This implies they've either created one or been granted access.
+        accessible_datasets = await get_user_accessible_datasets(user_uid)
+        if accessible_datasets is None: # Error fetching from Firestore
+            logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify existing workspace access. Please try again.")
+        
+        if accessible_datasets: # If the list is not empty, they have access to at least one.
+            logger_api.warning(
+                f"User '{user_uid}' (Role: '{user_role}') attempted to create workspace '{req.dataset_id}' "
+                f"but already has access to {len(accessible_datasets)} workspace(s). Creation denied."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are limited to creating/accessing one workspace initially. Please contact an administrator if you need access to more."
+            )
+        logger_api.info(f"User '{user_uid}' (Role: '{user_role}') is a normal user and currently has access to 0 workspaces. Creation allowed.")
+
+    # Proceed with BigQuery dataset creation
     if not API_GCP_PROJECT:
-        logger_api.error("Cannot create dataset: GCP_PROJECT not configured.")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+        logger_api.error("Cannot create workspace: API_GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error: Missing project ID.")
 
-    logger_api.info(f"Admin request received to create dataset '{req.dataset_id}' in location '{req.location or DEFAULT_BQ_LOCATION}'")
+    dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, req.dataset_id)
+    dataset = bigquery.Dataset(dataset_ref)
+    dataset.location = req.location or DEFAULT_BQ_LOCATION
+    if req.description: dataset.description = req.description
+    if req.labels: dataset.labels = req.labels
 
+    created_bq_dataset_obj = None
     try:
-        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, req.dataset_id)
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = req.location or DEFAULT_BQ_LOCATION
-        if req.description: dataset.description = req.description
-        if req.labels: dataset.labels = req.labels
+        created_bq_dataset_obj = bq_client.create_dataset(dataset, timeout=30, exists_ok=False)
+        logger_api.info(f"User '{user_uid}' successfully created BigQuery dataset: {created_bq_dataset_obj.full_dataset_id}")
 
-        # created_dataset = api_bigquery_client.create_dataset(dataset, timeout=30, exists_ok=False)
-        created_dataset = bq_client.create_dataset(dataset, timeout=30, exists_ok=False)
-        logger_api.info(f"Admin successfully created dataset: {created_dataset.full_dataset_id}")
+        # Register in Firestore and grant access to creator
+        firestore_success = await register_workspace_and_grant_access(
+            dataset_id=created_bq_dataset_obj.dataset_id,
+            owner_uid=user_uid,
+            location=created_bq_dataset_obj.location,
+            description=created_bq_dataset_obj.description,
+            labels=created_bq_dataset_obj.labels
+        )
+
+        if not firestore_success:
+            logger_api.error(
+                f"CRITICAL: BigQuery dataset '{created_bq_dataset_obj.dataset_id}' created by user '{user_uid}', "
+                f"but FAILED to register in Firestore or grant access. Attempting BigQuery dataset cleanup."
+            )
+            try:
+                bq_client.delete_dataset(dataset_ref, delete_contents=True, not_found_ok=True)
+                logger_api.info(f"Successfully cleaned up BigQuery dataset '{created_bq_dataset_obj.dataset_id}' after Firestore registration failure.")
+            except Exception as cleanup_error:
+                logger_api.error(
+                    f"CRITICAL ROLLBACK FAILURE: FAILED to clean up BigQuery dataset '{created_bq_dataset_obj.dataset_id}': {cleanup_error}."
+                )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Workspace creation partially failed. Please contact support.")
 
         return DatasetCreatedResponse(
-            project_id=created_dataset.project,
-            dataset_id=created_dataset.dataset_id,
-            location=created_dataset.location,
-            description=created_dataset.description,
-            labels=created_dataset.labels,
+            project_id=created_bq_dataset_obj.project,
+            dataset_id=created_bq_dataset_obj.dataset_id,
+            location=created_bq_dataset_obj.location,
+            description=created_bq_dataset_obj.description,
+            labels=created_bq_dataset_obj.labels,
         )
-    # Keep existing specific error handling
     except BadRequest as e:
-        logger_api.warning(f"Bad request creating dataset '{req.dataset_id}': {e}", exc_info=False)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request: {str(e)}")
-    except Conflict: # Catch the specific Conflict exception
-        logger_api.warning(f"Dataset '{req.dataset_id}' already exists in project '{API_GCP_PROJECT}'.")
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Dataset '{req.dataset_id}' already exists.")
+        logger_api.warning(f"Bad request error creating workspace '{req.dataset_id}' for user '{user_uid}': {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request for workspace creation: {str(e)}")
+    except Conflict:
+        logger_api.warning(f"Conflict: Workspace ID '{req.dataset_id}' already exists. Attempt by user '{user_uid}'.")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"The workspace ID '{req.dataset_id}' already exists.")
     except GoogleAPICallError as e:
-        logger_api.error(f"Google API Call Error creating dataset '{req.dataset_id}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API: {str(e)}")
+        logger_api.error(f"Google API Error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error with Google Cloud services.")
     except Exception as e:
-        logger_api.error(f"Unexpected error creating dataset '{req.dataset_id}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred: {str(e)}")
+        logger_api.error(f"Unexpected error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected server error during workspace creation.")
 
+
+# main.py
+# ... other imports ...
 
 @bq_router.delete(
-    "/datasets/{dataset_id}",
-    status_code=status.HTTP_204_NO_CONTENT, # Standard for successful DELETE
-    tags=["BigQuery"],
-    summary="Delete a BigQuery Dataset (Admin Only)",
-    description="Permanently deletes a BigQuery dataset and all its contents (tables, views). Requires administrator privileges.",
-    dependencies=[Depends(require_admin)], # Apply RBAC
-    responses={
-        204: {"description": "Dataset deleted successfully"},
-        403: {"description": "Permission denied: Admin role required"},
-        404: {"description": "Dataset not found"},
-        500: {"description": "Internal server error"},
-        502: {"description": "Error communicating with BigQuery API"},
-        503: {"description": "BigQuery service unavailable"}
-    }
+    "/datasets/{dataset_id_only}/tables/{table_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["BigQuery Tables"], # Changed tag for clarity
+    summary="Delete a specific BigQuery Table",
+    description="Permanently deletes a specific table within a workspace. Admins can delete any table. Normal users can only delete tables within workspaces they have access to.",
+    # Removed: dependencies=[Depends(require_admin)], # RBAC is handled inside
+    # ... (responses remain the same) ...
 )
-async def delete_bigquery_dataset(
-    dataset_id: str = Path(..., description="The ID of the dataset to delete.", example="my_team_dataset_to_delete"),
-    admin_user: dict = Depends(require_admin), # Get admin user data for logging if needed
-    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+async def delete_bigquery_table(
+    dataset_id_only: str = Path(..., description="The ID of the workspace (dataset name only)."),
+    table_id: str = Path(..., description="The ID of the table to delete."),
+    user: dict = Depends(verify_token), # Get current user
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
 ):
-    """
-    Deletes an existing BigQuery dataset, including all tables within it.
-    Requires the requesting user to have the 'admin' role stored in Firestore.
-    """
-    admin_uid = admin_user.get("uid", "unknown_admin") # Get admin UID for logging
-    # if not api_bigquery_client:
-    #     logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': BigQuery client not available.")
-    #     raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery service unavailable.")
-    if not API_GCP_PROJECT:
-        logger_api.error(f"Admin {admin_uid}: Cannot delete dataset '{dataset_id}': GCP_PROJECT not configured.")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+    user_uid = user.get("uid")
+    if not user_uid: # Should be caught by verify_token
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication error.")
 
-    full_dataset_id = f"{API_GCP_PROJECT}.{dataset_id}"
-    logger_api.warning(f"ADMIN ACTION by UID {admin_uid}: Attempting to DELETE dataset: {full_dataset_id} and all its contents!")
+    if not API_GCP_PROJECT:
+        logger_api.error(f"User {user_uid}: Cannot delete table '{table_id}' in dataset '{dataset_id_only}': API_GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error.")
+
+    # Check user's role and access
+    user_role = await get_user_role(user_uid)
+    can_delete = False
+    if user_role == 'admin':
+        can_delete = True
+        logger_api.info(f"Admin '{user_uid}' attempting to delete table '{table_id}' from workspace '{dataset_id_only}'.")
+    else: # Normal user
+        accessible_datasets = await get_user_accessible_datasets(user_uid)
+        if accessible_datasets is None: # Firestore error
+             logger_api.error(f"User '{user_uid}': Could not verify access to workspace '{dataset_id_only}' for table deletion due to Firestore error.")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify workspace access.")
+        if dataset_id_only in accessible_datasets:
+            can_delete = True
+            logger_api.info(f"User '{user_uid}' has access to workspace '{dataset_id_only}', attempting to delete table '{table_id}'.")
+        else:
+            logger_api.warning(f"User '{user_uid}' does not have access to workspace '{dataset_id_only}'. Deletion of table '{table_id}' denied.")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"You do not have permission to delete tables in workspace '{dataset_id_only}'.")
+    
+    if not can_delete: # Should not be reached if logic above is correct, but as a safeguard
+         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied to delete this table.")
+
+    full_table_id = f"{API_GCP_PROJECT}.{dataset_id_only}.{table_id}"
+    logger_api.warning(f"User '{user_uid}' (Role: {user_role}) is proceeding to DELETE table: {full_table_id}")
 
     try:
-        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, dataset_id)
-
-        # Delete the dataset.
-        # delete_contents=True: Deletes tables within the dataset. If False, deletion fails if dataset is not empty.
-        # not_found_ok=False: Raises NotFound exception if the dataset doesn't exist.
-        # api_bigquery_client.delete_dataset(
-        #     dataset_ref, delete_contents=True, not_found_ok=False
-        # )
-        bq_client.delete_dataset(
-            dataset_ref, delete_contents=True, not_found_ok=False
-        )
-
-        logger_api.info(f"Admin {admin_uid}: Successfully deleted dataset: {full_dataset_id}")
-        # Return HTTP 204 No Content on success, no response body needed.
-        # Note: Returning Response(status_code=204) might be more explicit for some frameworks
+        bq_client.delete_table(full_table_id, not_found_ok=False)
+        logger_api.info(f"User '{user_uid}': Successfully deleted table: {full_table_id}")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-
     except NotFound:
-        logger_api.warning(f"Admin {admin_uid}: Dataset not found during delete attempt: {full_dataset_id}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dataset '{dataset_id}' not found.")
+        logger_api.warning(f"User '{user_uid}': Table or dataset not found during delete attempt: {full_table_id}")
+        # ... (existing NotFound logic to check if dataset or table is missing) ...
+        try:
+            bq_client.get_dataset(f"{API_GCP_PROJECT}.{dataset_id_only}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table '{table_id}' not found in workspace '{dataset_id_only}'.")
+        except NotFound:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace '{dataset_id_only}' not found.")
+        except Exception as ds_check_err:
+            logger_api.error(f"Error checking dataset existence for {full_table_id}: {ds_check_err}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table or Workspace not found (verification error).")
     except GoogleAPICallError as e:
-        # Catch specific BQ API errors (e.g., permission issues on the *service account*)
-        logger_api.error(f"Admin {admin_uid}: Google API Call Error deleting dataset '{full_dataset_id}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API during deletion: {str(e)}")
+        logger_api.error(f"User '{user_uid}': Google API Error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with Google Cloud during table deletion.")
     except Exception as e:
-        # Catch any other unexpected errors
-        logger_api.error(f"Admin {admin_uid}: Unexpected error deleting dataset '{full_dataset_id}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during deletion: {str(e)}")
-
+        logger_api.error(f"User '{user_uid}': Unexpected error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected server error during table deletion.")
 # +++ END NEW ENDPOINT: Delete Dataset +++
+
+
+
 
 @bq_router.post("/suggest-prompt", response_model=PromptSuggestionResponse)
 async def suggest_prompt_completion(req: PromptSuggestionRequest):
