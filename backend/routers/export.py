@@ -309,11 +309,23 @@ async def export_query_to_excel( # Renamed to match your previous working one
             
             final_sheet_name = final_sheet_name[:31] # Enforce 31 char limit strictly
             
+            # This is inside the for table_fqn in source_tables: loop
             source_sheet = workbook.create_sheet(title=final_sheet_name)
-            for r_idx, row in enumerate(dataframe_to_rows(df_source_preview_naive, index=False, header=True), 1):
-                for c_idx, value in enumerate(row, 1):
-                    source_sheet.cell(row=r_idx, column=c_idx, value=value)
-            processed_sheet_names.add(final_sheet_name)
+            if df_source_preview_naive is not None and not df_source_preview_naive.empty: # Add this check
+                for r_idx, row_values_tuple in enumerate(dataframe_to_rows(df_source_preview_naive, index=False, header=True), 1):
+                    for c_idx, value in enumerate(row_values_tuple, 1):
+                        cell_to_write = value
+                        if pd.isna(value): # Checks for pd.NA, np.nan, None effectively
+                            cell_to_write = "" # Replace with empty string
+                        
+                        try:
+                            source_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
+                        except Exception as cell_write_error: # Catch any other rare conversion error
+                            logger_export.warning(f"Sheet '{final_sheet_name}': Error writing value {cell_to_write!r} (original: {value!r}, type: {type(value)}) to cell ({r_idx},{c_idx}). Error: {cell_write_error}. Writing fallback 'ERROR_VAL'.")
+                            source_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL") # Fallback if "" also fails
+            else:
+                source_sheet.cell(row=1, column=1, value="No data or error fetching preview.")
+            processed_sheet_names.add(final_sheet_name) # This was already there
             logger_export.info(f"Source table preview '{table_fqn}' written to sheet '{final_sheet_name}'.")
 
         # --- Sheet N+1: Chart Image and Info (if provided) ---
@@ -375,7 +387,20 @@ async def export_query_to_excel( # Renamed to match your previous working one
             
             df_chart = pd.DataFrame(payload.chart_data)
             df_chart_naive = make_datetime_naive(df_chart.copy())
-
+            # In the section "Sheet N+2: Raw Chart Data"
+            # After df_chart_naive = make_datetime_naive(df_chart.copy())
+            if not df_chart_naive.empty: # Add this check
+                for r_idx, row_val_list in enumerate(dataframe_to_rows(df_chart_naive, index=False, header=True), 1):
+                    for c_idx, value in enumerate(row_val_list, 1):
+                        cell_to_write = value
+                        if pd.isna(value):
+                            cell_to_write = ""
+                        
+                        try:
+                            chart_data_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
+                        except Exception as cell_write_error_chart:
+                            logger_export.warning(f"Sheet '{unique_chart_data_sheet_title}': Error writing value {cell_to_write!r} (original: {value!r}, type: {type(value)}) to cell ({r_idx},{c_idx}). Error: {cell_write_error_chart}. Writing fallback 'ERROR_VAL'.")
+                            chart_data_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL")
             for r_idx, row_val_list in enumerate(dataframe_to_rows(df_chart_naive, index=False, header=True), 1):
                 for c_idx, value in enumerate(row_val_list, 1):
                     chart_data_sheet.cell(row=r_idx, column=c_idx, value=value)
