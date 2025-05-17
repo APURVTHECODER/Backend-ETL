@@ -304,7 +304,7 @@ async def remove_workspace_from_firestore(dataset_id: str) -> bool:
         # Step 1: Delete the workspace's metadata document
         workspace_doc_ref = db.collection(WORKSPACE_METADATA_COLLECTION).document(dataset_id)
         # Check if it exists before trying to delete to avoid error if already gone
-        workspace_doc = await workspace_doc_ref.get()
+        workspace_doc =  workspace_doc_ref.get()
         if workspace_doc.exists:
             batch.delete(workspace_doc_ref)
             logger_firestore.info(f"Scheduled deletion for workspace metadata document: '{WORKSPACE_METADATA_COLLECTION}/{dataset_id}'.")
@@ -319,13 +319,13 @@ async def remove_workspace_from_firestore(dataset_id: str) -> bool:
         # Firestore transactions or batches are better for multiple writes.
         # For simplicity with async, we'll iterate and update, but batching is preferred for >500 docs.
         docs_stream = users_with_access_query.stream() # Use stream for async iteration
-        async for user_doc_snapshot in docs_stream:
+        for user_doc_snapshot in docs_stream:
             logger_firestore.info(f"Found user '{user_doc_snapshot.id}' with access to '{dataset_id}'. Scheduling removal.")
             user_doc_ref = users_ref.document(user_doc_snapshot.id)
             # Atomically remove the dataset_id from the array
             batch.update(user_doc_ref, {'accessible_datasets': firestore.ArrayRemove([dataset_id])})
         
-        await batch.commit() # Commit all batched operations
+        batch.commit() # Commit all batched operations
         logger_firestore.info(f"Successfully committed Firestore operations for removing workspace '{dataset_id}'.")
         return True
 
