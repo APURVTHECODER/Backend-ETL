@@ -279,3 +279,58 @@ async def register_workspace_and_grant_access(
         # Consider more sophisticated rollback if step 2 fails after step 1 succeeded.
         # For simplicity, we're not implementing full transactional rollback across collections here.
         return False
+
+
+async def remove_workspace_from_firestore(dataset_id: str) -> bool:
+    """
+    Removes a workspace from Firestore:
+    1. Deletes the workspace's metadata document (e.g., from 'workspaces/{dataset_id}').
+    2. Removes the dataset_id from the 'accessible_datasets' array of all users
+       who had access to it.
+    """
+    global db
+    if db is None:
+        logger_firestore.error(f"Firestore client is None. Cannot remove workspace '{dataset_id}'.")
+        return False
+
+    logger_firestore.info(f"Attempting to remove workspace '{dataset_id}' and its references from Firestore.")
+    
+    WORKSPACE_METADATA_COLLECTION = 'workspaces' # Or 'datasets' if that's your metadata collection name
+
+    batch = db.batch()
+    success = True
+
+    try:
+        # Step 1: Delete the workspace's metadata document
+        workspace_doc_ref = db.collection(WORKSPACE_METADATA_COLLECTION).document(dataset_id)
+        # Check if it exists before trying to delete to avoid error if already gone
+        workspace_doc = await workspace_doc_ref.get()
+        if workspace_doc.exists:
+            batch.delete(workspace_doc_ref)
+            logger_firestore.info(f"Scheduled deletion for workspace metadata document: '{WORKSPACE_METADATA_COLLECTION}/{dataset_id}'.")
+        else:
+            logger_firestore.warning(f"Workspace metadata document '{WORKSPACE_METADATA_COLLECTION}/{dataset_id}' not found for deletion.")
+
+        # Step 2: Remove the dataset_id from all users' accessible_datasets arrays
+        users_ref = db.collection('users')
+        # Query for users who have this dataset_id in their accessible_datasets array
+        users_with_access_query = users_ref.where('accessible_datasets', 'array_contains', dataset_id)
+        
+        # Firestore transactions or batches are better for multiple writes.
+        # For simplicity with async, we'll iterate and update, but batching is preferred for >500 docs.
+        docs_stream = users_with_access_query.stream() # Use stream for async iteration
+        async for user_doc_snapshot in docs_stream:
+            logger_firestore.info(f"Found user '{user_doc_snapshot.id}' with access to '{dataset_id}'. Scheduling removal.")
+            user_doc_ref = users_ref.document(user_doc_snapshot.id)
+            # Atomically remove the dataset_id from the array
+            batch.update(user_doc_ref, {'accessible_datasets': firestore.ArrayRemove([dataset_id])})
+        
+        await batch.commit() # Commit all batched operations
+        logger_firestore.info(f"Successfully committed Firestore operations for removing workspace '{dataset_id}'.")
+        return True
+
+    except Exception as e:
+        logger_firestore.error(f"Error removing workspace '{dataset_id}' from Firestore: {e}", exc_info=True)
+        # If batch commit fails, individual operations might or might not have succeeded.
+        # This part is tricky to make fully atomic without transactions spanning collections (which Firestore doesn't easily do).
+        return False

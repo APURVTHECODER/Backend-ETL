@@ -27,7 +27,7 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access  # Import initializer
+from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore  # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
@@ -1552,6 +1552,73 @@ async def delete_bigquery_table(
         logger_api.error(f"Admin {admin_uid}: Unexpected error deleting table '{full_table_id}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during table deletion: {str(e)}")
 # ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
+
+
+@bq_router.delete(
+    "/datasets/{dataset_id}", # Path parameter is just {dataset_id}
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["BigQuery Workspaces"],
+    summary="Delete a BigQuery Workspace (Dataset) (Admin Only)",
+    description="Permanently deletes a BigQuery workspace and all its contents. Requires administrator privileges.",
+    dependencies=[Depends(require_admin)], 
+    responses={
+        204: {"description": "Workspace deleted successfully"},
+        403: {"description": "Permission denied: Admin role required"},
+        404: {"description": "Workspace not found"},
+        # ... other responses
+    }
+)
+async def delete_bigquery_workspace( 
+    dataset_id: str = Path(..., description="The ID of the workspace (dataset name only) to delete.", example="my_team_workspace_to_delete"),
+    admin_user: dict = Depends(require_admin), 
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
+):
+    admin_uid = admin_user.get("uid", "unknown_admin")
+    if not API_GCP_PROJECT:
+        logger_api.error(f"Admin {admin_uid}: Cannot delete workspace '{dataset_id}': API_GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error.")
+
+    full_dataset_id_for_bq = f"{API_GCP_PROJECT}.{dataset_id}" 
+
+    logger_api.warning(f"ADMIN ACTION by UID {admin_uid}: Attempting to DELETE workspace: {full_dataset_id_for_bq} (path param was: {dataset_id})")
+
+    try:
+        dataset_ref = bigquery.DatasetReference(API_GCP_PROJECT, dataset_id) 
+
+        # 1. Delete from BigQuery first
+        bq_client.delete_dataset(
+            dataset_ref, delete_contents=True, not_found_ok=False
+        )
+        logger_api.info(f"Admin {admin_uid}: Successfully deleted workspace from BigQuery: {full_dataset_id_for_bq}")
+        
+        # 2. --- CALL THE NEW FIRESTORE CLEANUP FUNCTION ---
+        # This should happen *after* successful BQ deletion.
+        # Pass the short dataset_id.
+        try:
+            firestore_cleanup_success = await remove_workspace_from_firestore(dataset_id)
+            if firestore_cleanup_success:
+                logger_api.info(f"Admin {admin_uid}: Successfully removed workspace '{dataset_id}' records from Firestore.")
+            else:
+                # Log an error but don't necessarily fail the whole operation if BQ delete succeeded.
+                # This indicates a partial success and might require manual Firestore cleanup.
+                logger_api.error(f"Admin {admin_uid}: Workspace '{dataset_id}' deleted from BigQuery, "
+                                 f"but FAILED to remove all records from Firestore. Manual cleanup may be needed.")
+        except Exception as fs_delete_error:
+            logger_api.error(f"Admin {admin_uid}: Exception during Firestore cleanup for workspace '{dataset_id}' "
+                             f"after BQ deletion: {fs_delete_error}", exc_info=True)
+            # Still, BQ deletion was successful, so we proceed.
+
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    except NotFound: # This is for BigQuery NotFound
+        logger_api.warning(f"Admin {admin_uid}: Workspace not found in BigQuery during delete attempt: {full_dataset_id_for_bq}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace '{dataset_id}' not found in project '{API_GCP_PROJECT}'.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"Admin {admin_uid}: Google API Error deleting workspace '{full_dataset_id_for_bq}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with Google Cloud during workspace deletion: {str(e)}")
+    except Exception as e:
+        logger_api.error(f"Admin {admin_uid}: Unexpected error deleting workspace '{full_dataset_id_for_bq}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during workspace deletion: {str(e)}")
 
 # --- Include Routers ---
 app.include_router(bq_router)
