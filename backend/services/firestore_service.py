@@ -4,7 +4,7 @@ import json
 import base64
 import logging
 import firebase_admin
-from typing import Optional,List 
+from typing import Dict, Optional,List 
 from firebase_admin import credentials, firestore, auth
 import logging
 import os # os might not be needed anymore if not checking path
@@ -216,3 +216,121 @@ async def get_uid_from_email(email: str) -> Optional[str]:
             exc_info=True # Include traceback in logs
         )
         return None
+    
+async def register_workspace_and_grant_access(
+    dataset_id: str,
+    owner_uid: str,
+    location: str,
+    description: Optional[str] = None,
+    labels: Optional[Dict[str, str]] = None
+) -> bool:
+    """
+    1. Creates a record for the new workspace in the 'workspaces' (or 'datasets') collection,
+       marking the owner and setting initial accessible_users to the owner.
+    2. Adds the new workspace ID to the owner's 'accessible_datasets' list in their
+       'users' collection document.
+    """
+    global db
+    if db is None:
+        logger_firestore.error("Firestore client is None. Cannot register workspace.")
+        return False
+
+    # Use a consistent collection name for workspace/dataset metadata.
+    # Let's assume 'workspaces' for this example. If you use 'datasets', adjust accordingly.
+    WORKSPACE_METADATA_COLLECTION = 'workspaces' # Or 'datasets' if that's what you use
+
+    try:
+        # --- Step 1: Create/Update the workspace document in WORKSPACE_METADATA_COLLECTION ---
+        workspace_doc_ref = db.collection(WORKSPACE_METADATA_COLLECTION).document(dataset_id)
+        workspace_data = {
+            'owner_uid': owner_uid,
+            'location': location,
+            'created_at': firestore.SERVER_TIMESTAMP,
+            'accessible_users': [owner_uid] # Initially, only the owner has explicit access listed here
+        }
+        if description:
+            workspace_data['description'] = description
+        if labels:
+            workspace_data['labels'] = labels
+
+        # Using set() will create if not exists, or overwrite if it does.
+        # If you need to prevent overwriting, you might use .create() and handle exceptions.
+        workspace_doc_ref.set(workspace_data)
+        logger_firestore.info(
+            f"Workspace metadata record created/updated for '{dataset_id}' in '{WORKSPACE_METADATA_COLLECTION}' with owner '{owner_uid}'."
+        )
+
+        # --- Step 2: Add this dataset_id to the owner's 'accessible_datasets' list in 'users' collection ---
+        user_doc_ref = db.collection('users').document(owner_uid)
+
+        # Atomically add the new dataset_id to the 'accessible_datasets' array.
+        # This also creates the 'accessible_datasets' field if it doesn't exist.
+        user_doc_ref.update({
+            'accessible_datasets': firestore.ArrayUnion([dataset_id])
+        })
+        logger_firestore.info(f"Added '{dataset_id}' to 'accessible_datasets' for user '{owner_uid}'.")
+
+        return True
+    except Exception as e:
+        logger_firestore.error(
+            f"Error in register_workspace_and_grant_access for workspace '{dataset_id}', owner '{owner_uid}': {e}",
+            exc_info=True
+        )
+        # Consider more sophisticated rollback if step 2 fails after step 1 succeeded.
+        # For simplicity, we're not implementing full transactional rollback across collections here.
+        return False
+
+
+async def remove_workspace_from_firestore(dataset_id: str) -> bool:
+    """
+    Removes a workspace from Firestore:
+    1. Deletes the workspace's metadata document (e.g., from 'workspaces/{dataset_id}').
+    2. Removes the dataset_id from the 'accessible_datasets' array of all users
+       who had access to it.
+    """
+    global db
+    if db is None:
+        logger_firestore.error(f"Firestore client is None. Cannot remove workspace '{dataset_id}'.")
+        return False
+
+    logger_firestore.info(f"Attempting to remove workspace '{dataset_id}' and its references from Firestore.")
+    
+    WORKSPACE_METADATA_COLLECTION = 'workspaces' # Or 'datasets' if that's your metadata collection name
+
+    batch = db.batch()
+    success = True
+
+    try:
+        # Step 1: Delete the workspace's metadata document
+        workspace_doc_ref = db.collection(WORKSPACE_METADATA_COLLECTION).document(dataset_id)
+        # Check if it exists before trying to delete to avoid error if already gone
+        workspace_doc =  workspace_doc_ref.get()
+        if workspace_doc.exists:
+            batch.delete(workspace_doc_ref)
+            logger_firestore.info(f"Scheduled deletion for workspace metadata document: '{WORKSPACE_METADATA_COLLECTION}/{dataset_id}'.")
+        else:
+            logger_firestore.warning(f"Workspace metadata document '{WORKSPACE_METADATA_COLLECTION}/{dataset_id}' not found for deletion.")
+
+        # Step 2: Remove the dataset_id from all users' accessible_datasets arrays
+        users_ref = db.collection('users')
+        # Query for users who have this dataset_id in their accessible_datasets array
+        users_with_access_query = users_ref.where('accessible_datasets', 'array_contains', dataset_id)
+        
+        # Firestore transactions or batches are better for multiple writes.
+        # For simplicity with async, we'll iterate and update, but batching is preferred for >500 docs.
+        docs_stream = users_with_access_query.stream() # Use stream for async iteration
+        for user_doc_snapshot in docs_stream:
+            logger_firestore.info(f"Found user '{user_doc_snapshot.id}' with access to '{dataset_id}'. Scheduling removal.")
+            user_doc_ref = users_ref.document(user_doc_snapshot.id)
+            # Atomically remove the dataset_id from the array
+            batch.update(user_doc_ref, {'accessible_datasets': firestore.ArrayRemove([dataset_id])})
+        
+        batch.commit() # Commit all batched operations
+        logger_firestore.info(f"Successfully committed Firestore operations for removing workspace '{dataset_id}'.")
+        return True
+
+    except Exception as e:
+        logger_firestore.error(f"Error removing workspace '{dataset_id}' from Firestore: {e}", exc_info=True)
+        # If batch commit fails, individual operations might or might not have succeeded.
+        # This part is tricky to make fully atomic without transactions spanning collections (which Firestore doesn't easily do).
+        return False
