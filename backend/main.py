@@ -27,7 +27,7 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore  # Import initializer
+from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore,ensure_user_document_exists   # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
@@ -1222,28 +1222,65 @@ async def list_bigquery_datasets(
     description="Creates a new BigQuery workspace. Administrators can create multiple workspaces. Normal users are restricted to creating a single workspace to which they get automatic access.",
     # Removed: dependencies=[Depends(require_admin)] # Role logic is now handled inside
 )
-async def create_bigquery_workspace( # Renamed for clarity
+
+@bq_router.post(
+    "/datasets",
+    response_model=DatasetCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["BigQuery Workspaces"],
+    summary="Create a new BigQuery Workspace (Dataset)",
+    description="Creates a new BigQuery workspace...",
+)
+async def create_bigquery_workspace(
     req: CreateDatasetRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(verify_token), # user is the decoded token from verify_token
 ):
     user_uid = user.get("uid")
+    user_email = user.get("email") # Assuming your token contains email
+    # display_name might also be in the token, or you might not store it.
+    # user_display_name = user.get("name") 
+
     if not user_uid:
         logger_api.error("User UID not found in token during workspace creation attempt.")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication error: User ID not found.")
 
+    # +++ ENSURE USER DOCUMENT EXISTS IN FIRESTORE +++
+    # Pass email if available from the token, it's good to store it.
+    doc_ensured = await ensure_user_document_exists(user_uid, email=user_email)
+    if not doc_ensured:
+        logger_api.error(f"Failed to ensure Firestore document exists for user '{user_uid}'. Cannot proceed with workspace creation.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User profile could not be initialized. Please try again or contact support."
+        )
+    # ++++++++++++++++++++++++++++++++++++++++++++++++
+
     user_role = await get_user_role(user_uid)
+    # If user_role is still None here, it means ensure_user_document_exists might have created it,
+    # but get_user_role fetched before a potential update, OR ensure_user_document_exists failed to add 'role'
+    # The updated ensure_user_document_exists tries to mitigate this.
+    # A fresh call to get_user_role *after* ensure_user_document_exists should be reliable.
+    if user_role is None: # Should ideally not happen if doc_ensured is True
+        logger_api.error(f"User role is None for {user_uid} even after ensuring document. This is unexpected.")
+        # Re-fetch role just in case there was a slight delay or if ensure_user_document_exists just created it
+        user_role = await get_user_role(user_uid)
+        if user_role is None:
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not determine user role.")
+
+
     logger_api.info(f"Workspace creation attempt by user '{user_uid}' (Role: '{user_role}') for workspace ID '{req.dataset_id}'.")
 
     if user_role != 'admin':
-        # For non-admin users, check if they already have access to any workspace.
-        # This implies they've either created one or been granted access.
         accessible_datasets = await get_user_accessible_datasets(user_uid)
-        if accessible_datasets is None: # Error fetching from Firestore
-            logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error.")
+        if accessible_datasets is None:
+            logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error (accessible_datasets is None).")
+            # This path should be less likely now if ensure_user_document_exists ran successfully
+            # because get_user_accessible_datasets returns [] if doc exists but field is missing.
+            # So, `None` here would imply a more fundamental issue during the fetch itself.
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify existing workspace access. Please try again.")
         
-        if accessible_datasets: # If the list is not empty, they have access to at least one.
+        if accessible_datasets: # If the list is not empty
             logger_api.warning(
                 f"User '{user_uid}' (Role: '{user_role}') attempted to create workspace '{req.dataset_id}' "
                 f"but already has access to {len(accessible_datasets)} workspace(s). Creation denied."
@@ -1254,7 +1291,7 @@ async def create_bigquery_workspace( # Renamed for clarity
             )
         logger_api.info(f"User '{user_uid}' (Role: '{user_role}') is a normal user and currently has access to 0 workspaces. Creation allowed.")
 
-    # Proceed with BigQuery dataset creation
+    # ... (rest of your create_bigquery_workspace function remains the same) ...
     if not API_GCP_PROJECT:
         logger_api.error("Cannot create workspace: API_GCP_PROJECT not configured.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error: Missing project ID.")
@@ -1272,7 +1309,7 @@ async def create_bigquery_workspace( # Renamed for clarity
 
         # Register in Firestore and grant access to creator
         firestore_success = await register_workspace_and_grant_access(
-            dataset_id=created_bq_dataset_obj.dataset_id,
+            dataset_id=created_bq_dataset_obj.dataset_id, # Pass short ID
             owner_uid=user_uid,
             location=created_bq_dataset_obj.location,
             description=created_bq_dataset_obj.description,
@@ -1291,6 +1328,8 @@ async def create_bigquery_workspace( # Renamed for clarity
                 logger_api.error(
                     f"CRITICAL ROLLBACK FAILURE: FAILED to clean up BigQuery dataset '{created_bq_dataset_obj.dataset_id}': {cleanup_error}."
                 )
+            # This situation is tricky. The BQ dataset exists but Firestore is inconsistent.
+            # Forcing a 500 error is one way to signal a problem that needs attention.
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Workspace creation partially failed. Please contact support.")
 
         return DatasetCreatedResponse(
@@ -1300,18 +1339,19 @@ async def create_bigquery_workspace( # Renamed for clarity
             description=created_bq_dataset_obj.description,
             labels=created_bq_dataset_obj.labels,
         )
-    except BadRequest as e:
+    except BadRequest as e: # e.g. invalid dataset_id format
         logger_api.warning(f"Bad request error creating workspace '{req.dataset_id}' for user '{user_uid}': {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request for workspace creation: {str(e)}")
-    except Conflict:
-        logger_api.warning(f"Conflict: Workspace ID '{req.dataset_id}' already exists. Attempt by user '{user_uid}'.")
+    except Conflict: # Dataset already exists in BQ
+        logger_api.warning(f"Conflict: Workspace ID '{req.dataset_id}' already exists in BigQuery. Attempt by user '{user_uid}'.")
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"The workspace ID '{req.dataset_id}' already exists.")
     except GoogleAPICallError as e:
-        logger_api.error(f"Google API Error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error with Google Cloud services.")
-    except Exception as e:
+        logger_api.error(f"Google API Error creating BigQuery dataset '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error with Google Cloud services during workspace creation.")
+    except Exception as e: # Catch-all for other unexpected errors
         logger_api.error(f"Unexpected error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected server error during workspace creation.")
+
 
 
 # main.py
