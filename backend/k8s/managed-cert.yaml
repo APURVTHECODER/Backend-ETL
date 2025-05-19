@@ -1,0 +1,8 @@
+# apiVersion: networking.gke.io/v1
+# kind: ManagedCertificate
+# metadata:
+#   name: thefrontmangames-com-cert
+# spec:
+#   domains:
+#     - thefrontmangames.com
+#     - test99.thefrontmangames.com

@@ -245,7 +245,7 @@ jobs:
       # Applies static resources first, then templated ones
       - name: Apply Kubernetes Resources
         run: |
-          echo "Applying static services and ingress..."
+          echo "Applying ManagedCertificate, static services, and ingress..."
           kubectl apply -f backend/k8s/backend-service.yaml
           kubectl apply -f backend/k8s/frontend-service.yaml # Assuming you have a frontend
           kubectl apply -f backend/k8s/ingress.yaml

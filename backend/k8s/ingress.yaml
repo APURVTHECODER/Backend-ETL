@@ -1,33 +1,68 @@
+# ingress.yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: app-ingress
+  name: app-ingress-1 # Or your current active Ingress name that has the IP
+  namespace: default
   annotations:
     kubernetes.io/ingress.class: "gce"
-    # Uncomment and set if you have a reserved static IP:
-    # kubernetes.io/ingress.global-static-ip-name: "your-static-ip-name"
-    # Uncomment and set if using GKE ManagedCertificate for HTTPS:
-    # networking.gke.io/managed-certificates: "your-managed-cert-name"
+    # --- IMPORTANT ---
+    # REMOVE or COMMENT OUT any of these if they exist:
+    # ingress.gcp.kubernetes.io/pre-shared-cert: "mcrt-..."
+    # networking.gke.io/managed-certificates: "some-google-managed-cert-name"
+    #
+    # You can ADD other annotations if needed, for example, a static IP:
+    # kubernetes.io/ingress.global-static-ip-name: "your-reserved-static-ip-name"
+    #
+    # Or if you want to force HTTP to HTTPS redirect (GKE does this by default for GCE ingress if TLS is configured):
+    # kubernetes.io/ingress.allow-http: "false" # This is often default when TLS is present
+    # networking.gke.io/v1beta1.FrontendConfig is another way for more advanced redirect config
 spec:
-  defaultBackend:
+  # ingressClassName: "gce" # You are using the annotation, this is fine too.
+                           # If using ingressClassName, the annotation isn't strictly needed
+                           # but having the annotation ensures compatibility.
+  defaultBackend: # Optional if your rules cover all expected traffic
     service:
-      name: frontend-service    # Change or remove if no frontend
+      name: frontend-service
       port:
         number: 80
+  # --- TLS SECTION ---
+  # This tells the Ingress to use your SSL certificate for the specified hosts
+  tls:
+    - hosts:
+        - thefrontmangames.com
+        # If your PositiveSSL certificate also covers www.thefrontmangames.com, add it:
+        # - www.thefrontmangames.com
+      secretName: thefrontmangames-com-tls-secret # <-- Name of the K8s secret you just created
+  # --- RULES SECTION ---
+  # Ensure you have a rule for the host(s) listed in the TLS section
   rules:
-    - http:
+    - host: thefrontmangames.com
+      http:
         paths:
           - path: /api
             pathType: Prefix
             backend:
               service:
-                name: backend-service
+                name: backend-service # Ensure this service and its pods are healthy
                 port:
                   number: 80
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: frontend-service    # All other traffic
+                name: frontend-service # Ensure this service and its pods are healthy
                 port:
                   number: 80
+    # If you added www.thefrontmangames.com to tls.hosts, add a rule for it too:
+    # - host: www.thefrontmangames.com
+    #   http:
+    #     paths:
+    #       # ... same paths or redirect to non-www ...
+    #       - path: /
+    #         pathType: Prefix
+    #         backend:
+    #           service:
+    #             name: frontend-service
+    #             port:
+    #               number: 80

@@ -415,6 +415,7 @@ Each table lists its columns with their data types in parentheses (e.g., `column
 **User Request:** "{req.prompt}"
 
 **Instructions:**
+0.  **Data Types** Handle Datatypes Yourself.
 1.  **Query Type:** Generate ONLY a valid BigQuery `SELECT` query. Do not generate DML or DDL.
 2.  **STRICT Schema Adherence & Column Ownership (CRITICAL):**
     *   The *only* valid tables, columns, and data types you can use are those explicitly listed in the "Database Schema" section above.
@@ -436,7 +437,12 @@ Each table lists its columns with their data types in parentheses (e.g., `column
 7.  **Syntax:** Use correct BigQuery Standard SQL syntax.
 8.  **Assumptions:** Make reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions.
 9.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
-
+10.  **Date Handling (VERY IMPORTANT):**
+    *   The schema contains DATE and TIMESTAMP columns. These require specific formatting and comparison techniques in SQL WHERE clauses.
+    *   **Comparing with DATE Columns:** If the User Request includes a date (e.g., "after 15-03-2024", "on 2024/03/15"), convert it to the standard 'YYYY-MM-DD' format and use `DATE('YYYY-MM-DD')` for comparisons (e.g., `WHERE date_col > DATE('2024-03-15')`).
+    *   **Comparing TIMESTAMPs as Dates:** When comparing a column with a TIMESTAMP type (like `HireDate` or `EndDate`) against a specific date provided by the user (e.g., "hired before 2023-01-01", "ended on 10-05-2024"), **extract the date part from the TIMESTAMP column** using the `DATE()` function before comparing. Example: Instead of `t2.EndDate >= DATE '2024-01-01'`, generate `DATE(t2.EndDate) >= DATE '2024-01-01'`. This correctly compares just the date portion.
+    *   **Comparing with TIMESTAMP Columns (Specific Time):** Only use full `TIMESTAMP('YYYY-MM-DD HH:MM:SS')` comparisons or `TIMESTAMP_TRUNC` if the user explicitly mentions a specific time or uses terms implying time precision (e.g., "after 2 PM", "since midnight yesterday"). Otherwise, prefer the `DATE()` extraction method above for date-level comparisons.
+    *   **Relative Dates:** Interpret relative dates like "yesterday", "last week", "last month" using appropriate BigQuery date/timestamp functions based on the current date (assume today is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}). Remember to apply the `DATE(...)` extraction if comparing the result against a TIMESTAMP column for just the date part.
 Generated BigQuery SQL Query:
 """
         # --- END: Modified Prompt Template ---
@@ -1427,6 +1433,72 @@ JSON Array of Suggestions:
         return PromptSuggestionResponse(suggestions=[], error="Failed to generate suggestions.")
 # +++ END NEW ENDPOINT: Create Dataset +++
 
+@bq_router.delete(
+    "/datasets/{dataset_id_only}/tables/{table_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["BigQuery", "Admin"], # Add Admin tag maybe
+    summary="Delete a specific BigQuery Table (Admin Only)",
+    description="Permanently deletes a specific table within a dataset. Requires administrator privileges.",
+    dependencies=[Depends(require_admin)], # Apply RBAC
+    responses={
+        204: {"description": "Table deleted successfully"},
+        403: {"description": "Permission denied: Admin role required"},
+        404: {"description": "Dataset or Table not found"},
+        500: {"description": "Internal server error"},
+        502: {"description": "Error communicating with BigQuery API"},
+        503: {"description": "BigQuery service unavailable"}
+    }
+)
+async def delete_bigquery_table(
+    dataset_id_only: str = Path(..., description="The ID of the dataset (workspace name only, e.g., 'MVP').", example="MVP"),
+    table_id: str = Path(..., description="The ID of the table to delete.", example="Master_Data_Employee_Records_backup"),
+    admin_user: dict = Depends(require_admin), # Get admin user data for logging
+    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+):
+    """
+    Deletes an existing BigQuery table within a specified dataset. (Admin Only)
+    Requires the requesting user to have the 'admin' role stored in Firestore.
+    """
+    admin_uid = admin_user.get("uid", "unknown_admin")
+    if not API_GCP_PROJECT:
+        logger_api.error(f"Admin {admin_uid}: Cannot delete table '{table_id}' in dataset '{dataset_id_only}': GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error (missing project ID).")
+
+    # Construct the full table ID: project.dataset.table
+    full_table_id = f"{API_GCP_PROJECT}.{dataset_id_only}.{table_id}"
+    logger_api.warning(f"ADMIN ACTION by UID {admin_uid}: Attempting to DELETE table: {full_table_id}")
+
+    try:
+        # Delete the table.
+        # not_found_ok=False: Raises NotFound exception if the table doesn't exist.
+        bq_client.delete_table(full_table_id, not_found_ok=False)
+
+        logger_api.info(f"Admin {admin_uid}: Successfully deleted table: {full_table_id}")
+        # Return HTTP 204 No Content on success
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    except NotFound:
+        logger_api.warning(f"Admin {admin_uid}: Table or dataset not found during delete attempt: {full_table_id}")
+        # Check if dataset exists to give slightly better error
+        try:
+            bq_client.get_dataset(f"{API_GCP_PROJECT}.{dataset_id_only}")
+            # If dataset exists, the table must be missing
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table '{table_id}' not found in dataset '{dataset_id_only}'.")
+        except NotFound:
+             # Dataset itself is missing
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dataset '{dataset_id_only}' not found.")
+        except Exception as ds_check_err: # Catch errors during dataset check
+             logger_api.error(f"Error checking dataset existence during table delete for {full_table_id}: {ds_check_err}")
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table '{table_id}' or Dataset '{dataset_id_only}' not found (verification error).")
+
+    except GoogleAPICallError as e:
+        # Catch specific BQ API errors (e.g., permission issues on the *service account*)
+        logger_api.error(f"Admin {admin_uid}: Google API Call Error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with BigQuery API during table deletion: {str(e)}")
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger_api.error(f"Admin {admin_uid}: Unexpected error deleting table '{full_table_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during table deletion: {str(e)}")
 # ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
 
 # --- Include Routers ---
