@@ -431,11 +431,67 @@ Each table lists its columns with their data types in parentheses (e.g., `column
         *   `Master_Data_Employee_Details` (contains `Department` name) links to `Master_Data_Status_Department` (contains `Budget`) using the `Department` column (string comparison).
         *   Therefore, to get Salary and Budget together, you NEED to join all three tables.
     *   Pay close attention to column data types when creating JOIN conditions. Use CAST functions (e.g., `CAST(t2.EmployeeID AS STRING)`) only when necessary to match types between join keys.
+*   **CRITICAL for "Final Grade" or Single Category Lookups from Ranges (e.g., Marks to Grade, Sales to Tier):** When the user asks for a singular result like "final grade" or "the department tier" and this involves comparing a value (e.g., `Total_Marks`) against a table of ranges (e.g., `Marks_Lower_Limit` in `STUDENT_Sheet3`), you **MUST** ensure only ONE definitive category (e.g., Grade) is returned for each primary entity (e.g., Student). The output should not repeat the primary entity's key (e.g., `Roll_No`) with different categories from the lookup table.
+*   **Correct Logic:** The single correct category is the one associated with the **HIGHEST `Marks_Lower_Limit` (or similar `lower_bound_column`) that the student's `Total_Marks` (or similar `value_column`) is greater than or equal to.**
+*   **SQL Strategy for BigQuery (Mandatory for this pattern to avoid errors and ensure uniqueness):** Use a Common Table Expression (CTE) with `ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) as rn` and then join/select `WHERE rn = 1`. Alternatively, use a `LEFT JOIN ... QUALIFY ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) = 1`.
+*   **Example for "List unique roll numbers, their department names, and their final grades":**
+    ```sql
+    WITH StudentGrades AS (
+      SELECT
+        s1.Roll_No,
+        s3.Grade,
+        ROW_NUMBER() OVER (PARTITION BY s1.Roll_No ORDER BY s3.Marks_Lower_Limit DESC) as rn
+      FROM
+        `YourDatasetID.STUDENT_Sheet1` AS s1
+      LEFT JOIN
+        `YourDatasetID.STUDENT_Sheet3` AS s3 ON s1.Total_Marks >= s3.Marks_Lower_Limit
+    )
+    SELECT
+      s1.Roll_No,
+      s2.Dept_Name,
+      sg.Grade
+    FROM
+      `YourDatasetID.STUDENT_Sheet1` AS s1
+    INNER JOIN
+      `YourDatasetID.STUDENT_Sheet2` AS s2 ON s1.Dept_Code = t2.Dept_Code
+    LEFT JOIN
+      StudentGrades sg ON s1.Roll_No = sg.Roll_No AND sg.rn = 1;
+    ```
+*   **AVOID:** Simple `INNER JOIN ... ON value_column >= lower_bound_column` by itself for these scenarios as it will produce incorrect, repetitive results.
+# This is the text to add to your prompt template
+X. **Consolidating Information from Multiple Similar Lookup Tables (CRITICAL FOR COMPLETE RESULTS):**
+    *   If the schema contains multiple tables that appear to provide the same type of lookup information for different subsets of keys (e.g., `Product_ID` and `Price` appearing in `ProductLookupTable_A` AND `ProductLookupTable_B`), you **MUST** devise a strategy to combine data from ALL relevant lookup tables to provide a complete picture.
+    *   **Common Strategy:** Use `UNION ALL` to combine the relevant columns (e.g., `Product_ID`, `Price`) from these similar lookup tables into a single conceptual lookup source (often within a CTE). Then, `LEFT JOIN` the main table (e.g., Sales Transactions) to this consolidated CTE.
+    *   **Example for consolidating two product price tables (`PriceTable1`, `PriceTable2`) to get a price for `SalesTable.ProductID`:**
+        ```sql
+        WITH AllProductPrices AS (
+            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable1`
+            UNION ALL
+            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable2`
+            -- Ensure column names and types are compatible for UNION ALL
+        )
+        SELECT
+            s.Sales_Rep,
+            s.Product_ID,
+            s.Units,
+            app.Price AS unit_price,
+            (s.Units * app.Price) AS total_amount
+        FROM
+            `YourDatasetID.SalesTable` s
+        LEFT JOIN
+            AllProductPrices app ON s.Product_ID = app.Product_ID;
+        ```
+    *   The goal is to avoid missing data (like Mars products in your case) just because their pricing information resides in a separate, but logically related, lookup table.
+        *   **Alternative if direct join is complex:** Sometimes a `LEFT JOIN` with the condition directly in the `ON` clause combined with aggregation or `QUALIFY ROW_NUMBER()... = 1` can work.
+            `SELECT main.*, lookup.Grade FROM MainTable main LEFT JOIN LookupTable lookup ON main.TotalMarks >= lookup.MinMarks QUALIFY ROW_NUMBER() OVER (PARTITION BY main.ID ORDER BY lookup.MinMarks DESC) = 1`
+        *   **AVOID:** Direct correlated subqueries like `(SELECT Grade FROM LookupTable WHERE MainTable.TotalMarks >= LookupTable.MinMarks ... LIMIT 1)` if they cause errors in BigQuery. Guide towards JOIN-based de-correlation.
 4.  **Mapping User Language to Schema:** Carefully map terms from the "User Request" to the actual column names and tables in the "Database Schema".
 5.  **Table Qualification:** ALWAYS fully qualify table names: {full_dataset_id_str}.`YourTableName`. Use backticks `` ` ``.
 6.  **Column Qualification:** Use table aliases (e.g., `t1`, `t2`, `t3`) and qualify ALL column names. Ensure qualified columns correctly reference their owning table alias.
 7.  **Syntax:** Use correct BigQuery Standard SQL syntax.
-8.  **Assumptions:** Make reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions.
+8.  **Assumptions:** 
+    *   **For requests like "list [entity] and their grade," assume a single, definitive grade is required for each entity based on their marks and the provided grade boundaries.**
+    *   Make other reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, OR IF A REQUEST IMPLIES A SINGLE VALUE FROM A LOOKUP BUT THE JOIN LOGIC ISN'T OBVIOUS TO ACHIEVE THIS, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions. 
 9.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
 10.  **Date Handling (VERY IMPORTANT):**
     *   The schema contains DATE and TIMESTAMP columns. These require specific formatting and comparison techniques in SQL WHERE clauses.
