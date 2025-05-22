@@ -334,3 +334,70 @@ async def remove_workspace_from_firestore(dataset_id: str) -> bool:
         # If batch commit fails, individual operations might or might not have succeeded.
         # This part is tricky to make fully atomic without transactions spanning collections (which Firestore doesn't easily do).
         return False
+    
+# services/firestore_service.py
+# ... (existing imports and code) ...
+
+async def ensure_user_document_exists(user_uid: str, email: Optional[str] = None, display_name: Optional[str] = None) -> bool:
+    """
+    Checks if a user document exists in Firestore for the given UID.
+    If not, it creates a new document with default values.
+
+    Args:
+        user_uid: The Firebase UID of the user.
+        email: The user's email (optional, but good to store).
+        display_name: The user's display name (optional).
+
+    Returns:
+        True if the document exists or was successfully created, False on error.
+    """
+    global db
+    if db is None:
+        logger_firestore.error(f"Firestore client is None. Cannot ensure user document for UID: {user_uid}")
+        return False
+
+    logger_firestore.info(f"Ensuring Firestore document exists for UID: {user_uid}")
+    user_doc_ref = db.collection('users').document(user_uid)
+
+    try:
+        user_doc =  user_doc_ref.get() # Use await for async get()
+
+        if user_doc.exists:
+            logger_firestore.info(f"User document already exists for UID: {user_uid}. Verifying essential fields.")
+            # Optionally, verify and update if essential fields like 'role' or 'accessible_datasets' are missing
+            # This can happen if the schema changed or an older document exists without these fields.
+            user_data = user_doc.to_dict()
+            updates_needed = {}
+            if 'role' not in user_data:
+                updates_needed['role'] = 'user'
+                logger_firestore.warning(f"User {user_uid} document exists but missing 'role'. Setting to default 'user'.")
+            if 'accessible_datasets' not in user_data:
+                updates_needed['accessible_datasets'] = []
+                logger_firestore.warning(f"User {user_uid} document exists but missing 'accessible_datasets'. Setting to empty list.")
+            
+            if updates_needed:
+                user_doc_ref.update(updates_needed) # Use await for async update()
+                logger_firestore.info(f"Updated missing essential fields for user {user_uid}.")
+            return True
+        else:
+            logger_firestore.info(f"User document NOT FOUND for UID: {user_uid}. Creating with default values.")
+            default_user_data = {
+                'uid': user_uid,
+                'role': 'user',  # Default role
+                'accessible_datasets': [],  # Default empty list
+                'createdAt': firestore.SERVER_TIMESTAMP,
+            }
+            if email:
+                default_user_data['email'] = email
+            if display_name:
+                default_user_data['displayName'] = display_name
+            
+            user_doc_ref.set(default_user_data) # Use await for async set()
+            logger_firestore.info(f"Successfully created user document for UID: {user_uid} with defaults.")
+            return True
+
+    except Exception as e:
+        logger_firestore.error(f"Error ensuring/creating user document for UID {user_uid}: {e}", exc_info=True)
+        return False
+
+# ... (rest of your firestore_service.py code) ...
