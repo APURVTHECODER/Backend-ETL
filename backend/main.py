@@ -6,6 +6,7 @@ import logging
 import tempfile
 import atexit # To help clean up the temp file
 import re
+from services.feedback_service import store_feedback
 from datetime import timedelta, timezone, datetime, date, time # Added date, time
 from typing import List, Dict, Any, Optional, Union
 import traceback
@@ -55,7 +56,11 @@ bq_router = APIRouter(
     tags=["BigQuery"],
     dependencies=[Depends(verify_token)] # Protect all BQ routes
 )
-
+feedback_router = APIRouter(
+    prefix="/api/feedback",
+    tags=["Feedback"],
+    dependencies=[Depends(verify_token)] # All feedback submissions require authentication
+)
 # --- Logging Setup ---
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -86,6 +91,26 @@ logger_api.info(f"CORS enabled for origins: {allowed_origins}")
 
 # --- Pydantic Models ---
 # --- Pydantic Models for Prompt Suggestion ---
+class FeedbackSubmission(BaseModel):
+    user_prompt: Optional[str] = None
+    generated_sql: Optional[str] = None
+    dataset_id: Optional[str] = None
+    ai_mode: Optional[str] = None
+    selected_tables: Optional[List[str]] = None
+    selected_columns: Optional[List[str]] = None
+    job_id: Optional[str] = None
+    job_status_summary: Optional[str] = None # e.g., "SUCCESS", "FAILED", "SUCCESS_BUT_INCORRECT"
+    job_error_message: Optional[str] = None
+    feedback_type: str # e.g., "Incorrect SQL", "Wrong Results", "Job Error", "Suggestion", "Positive"
+    user_description: str = Field(..., min_length=10) # Make description mandatory and have min length
+    user_corrected_sql: Optional[str] = None
+    page_context: Optional[str] = None # e.g., "/explorer", "/upload"
+    # user_id will be extracted from the token on the backend
+    # timestamp will be added by the backend
+
+class FeedbackResponse(BaseModel):
+    message: str
+    feedback_id: str
 class PromptSuggestionRequest(BaseModel):
     current_prompt: str = Field(..., description="The partial prompt typed by the user.")
     # Optional: Add dataset_id if you want suggestions tailored to schema later
@@ -1715,12 +1740,37 @@ async def delete_bigquery_workspace(
     except Exception as e:
         logger_api.error(f"Admin {admin_uid}: Unexpected error deleting workspace '{full_dataset_id_for_bq}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during workspace deletion: {str(e)}")
+    
+
+@feedback_router.post("/", response_model=FeedbackResponse, status_code=status.HTTP_201_CREATED)
+async def submit_user_feedback(
+    feedback_submission: FeedbackSubmission,
+    current_user: Dict[str, Any] = Depends(verify_token) # verify_token ensures user_id
+):
+    user_uid = current_user.get("uid")
+    if not user_uid:
+        # This should ideally be caught by verify_token, but as a safeguard
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
+
+    logger_api.info(f"Received feedback submission from user: {user_uid}, type: {feedback_submission.feedback_type}")
+
+    feedback_id = await store_feedback(user_uid, feedback_submission.model_dump(exclude_none=True))
+
+    if feedback_id:
+        return FeedbackResponse(message="Feedback submitted successfully.", feedback_id=feedback_id)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not store feedback at this time. Please try again later."
+        )
+    
 
 # --- Include Routers ---
 app.include_router(bq_router)
 app.include_router(chat_router)
 app.include_router(export_router) 
 app.include_router(user_profile_router) # +++ Include the new user profile router +++
+app.include_router(feedback_router)
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
