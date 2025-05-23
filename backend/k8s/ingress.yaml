@@ -30,14 +30,14 @@ spec:
   # This tells the Ingress to use your SSL certificate for the specified hosts
   tls:
     - hosts:
-        - thefrontmangames.com
+        - ai.thefrontmangames.com
         # If your PositiveSSL certificate also covers www.thefrontmangames.com, add it:
         # - www.thefrontmangames.com
-      secretName: thefrontmangames-com-tls-secret # <-- Name of the K8s secret you just created
+      secretName: ssl-cert-ai-thefrontmangames # <-- Name of the K8s secret you just created
   # --- RULES SECTION ---
   # Ensure you have a rule for the host(s) listed in the TLS section
   rules:
-    - host: thefrontmangames.com
+    - host: ai.thefrontmangames.com
       http:
         paths:
           - path: /api

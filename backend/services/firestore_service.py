@@ -400,4 +400,11 @@ async def ensure_user_document_exists(user_uid: str, email: Optional[str] = None
         logger_firestore.error(f"Error ensuring/creating user document for UID {user_uid}: {e}", exc_info=True)
         return False
 
+
+# +++ ADD THIS FUNCTION +++
+def get_firestore_client() -> Optional[firestore.Client]:
+    """Returns the initialized Firestore client instance."""
+    if db is None:
+        logger_firestore.error("Firestore client requested before initialization or initialization failed.")
+    return db
 # ... (rest of your firestore_service.py code) ...
