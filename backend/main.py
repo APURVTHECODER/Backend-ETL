@@ -19,7 +19,7 @@ from clients import initialize_google_clients, initialize_gemini, _cleanup_temp_
 from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path , status,Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse # Keep if used later
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field,conint
 import json
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
@@ -138,6 +138,9 @@ class TableDataResponse(BaseModel): rows: List[Dict[str, Any]]; totalRows: Optio
 class ETLRequest(BaseModel):
     object_name: str = Field(..., description="Full GCS path of the uploaded object (e.g., dataset_prefix/filename.xlsx)")
     target_dataset_id: str = Field(..., description="The BigQuery dataset ID to load the data into (e.g., my_team_dataset)")
+        # +++ NEW FIELDS FOR MULTI-HEADER +++
+    is_multi_header: Optional[bool] = Field(default=False, description="Indicates if the file has multi-level headers.")
+    header_depth: Optional[conint(ge=1, le=10)] = Field(None, description="Number of rows making up the header, if multi-header. Min 1, Max 10.")
 # +++ MODIFICATION END +++
 class ColumnInfo(BaseModel): name: str; type: str; mode: str
 class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
@@ -791,6 +794,12 @@ async def trigger_etl(
     # logger_api.info(f"Triggering ETL for object: {payload.object_name} (requested by {client_ip})")
     """Triggers the ETL process by publishing a message to Pub/Sub."""
     if not payload.object_name or not payload.target_dataset_id: raise HTTPException(400, "Invalid payload.")
+    if payload.is_multi_header and payload.header_depth is None:
+        raise HTTPException(400, "Invalid payload: header_depth is required when is_multi_header is true.")
+    if not payload.is_multi_header and payload.header_depth is not None:
+        logger_api.warning(f"header_depth provided for {payload.object_name} but is_multi_header is false. header_depth will be ignored.")
+        # Optionally, you could nullify it: payload.header_depth = None
+    # +++ END VALIDATION +++
     client_ip = request.client.host if request.client else "unknown"
     logger_api.info(f"Triggering ETL for: {payload.object_name} from {client_ip}")
     try:
