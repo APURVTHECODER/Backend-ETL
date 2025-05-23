@@ -27,7 +27,7 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore  # Import initializer
+from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore,ensure_user_document_exists   # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
@@ -431,11 +431,67 @@ Each table lists its columns with their data types in parentheses (e.g., `column
         *   `Master_Data_Employee_Details` (contains `Department` name) links to `Master_Data_Status_Department` (contains `Budget`) using the `Department` column (string comparison).
         *   Therefore, to get Salary and Budget together, you NEED to join all three tables.
     *   Pay close attention to column data types when creating JOIN conditions. Use CAST functions (e.g., `CAST(t2.EmployeeID AS STRING)`) only when necessary to match types between join keys.
+*   **CRITICAL for "Final Grade" or Single Category Lookups from Ranges (e.g., Marks to Grade, Sales to Tier):** When the user asks for a singular result like "final grade" or "the department tier" and this involves comparing a value (e.g., `Total_Marks`) against a table of ranges (e.g., `Marks_Lower_Limit` in `STUDENT_Sheet3`), you **MUST** ensure only ONE definitive category (e.g., Grade) is returned for each primary entity (e.g., Student). The output should not repeat the primary entity's key (e.g., `Roll_No`) with different categories from the lookup table.
+*   **Correct Logic:** The single correct category is the one associated with the **HIGHEST `Marks_Lower_Limit` (or similar `lower_bound_column`) that the student's `Total_Marks` (or similar `value_column`) is greater than or equal to.**
+*   **SQL Strategy for BigQuery (Mandatory for this pattern to avoid errors and ensure uniqueness):** Use a Common Table Expression (CTE) with `ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) as rn` and then join/select `WHERE rn = 1`. Alternatively, use a `LEFT JOIN ... QUALIFY ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) = 1`.
+*   **Example for "List unique roll numbers, their department names, and their final grades":**
+    ```sql
+    WITH StudentGrades AS (
+      SELECT
+        s1.Roll_No,
+        s3.Grade,
+        ROW_NUMBER() OVER (PARTITION BY s1.Roll_No ORDER BY s3.Marks_Lower_Limit DESC) as rn
+      FROM
+        `YourDatasetID.STUDENT_Sheet1` AS s1
+      LEFT JOIN
+        `YourDatasetID.STUDENT_Sheet3` AS s3 ON s1.Total_Marks >= s3.Marks_Lower_Limit
+    )
+    SELECT
+      s1.Roll_No,
+      s2.Dept_Name,
+      sg.Grade
+    FROM
+      `YourDatasetID.STUDENT_Sheet1` AS s1
+    INNER JOIN
+      `YourDatasetID.STUDENT_Sheet2` AS s2 ON s1.Dept_Code = t2.Dept_Code
+    LEFT JOIN
+      StudentGrades sg ON s1.Roll_No = sg.Roll_No AND sg.rn = 1;
+    ```
+*   **AVOID:** Simple `INNER JOIN ... ON value_column >= lower_bound_column` by itself for these scenarios as it will produce incorrect, repetitive results.
+# This is the text to add to your prompt template
+X. **Consolidating Information from Multiple Similar Lookup Tables (CRITICAL FOR COMPLETE RESULTS):**
+    *   If the schema contains multiple tables that appear to provide the same type of lookup information for different subsets of keys (e.g., `Product_ID` and `Price` appearing in `ProductLookupTable_A` AND `ProductLookupTable_B`), you **MUST** devise a strategy to combine data from ALL relevant lookup tables to provide a complete picture.
+    *   **Common Strategy:** Use `UNION ALL` to combine the relevant columns (e.g., `Product_ID`, `Price`) from these similar lookup tables into a single conceptual lookup source (often within a CTE). Then, `LEFT JOIN` the main table (e.g., Sales Transactions) to this consolidated CTE.
+    *   **Example for consolidating two product price tables (`PriceTable1`, `PriceTable2`) to get a price for `SalesTable.ProductID`:**
+        ```sql
+        WITH AllProductPrices AS (
+            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable1`
+            UNION ALL
+            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable2`
+            -- Ensure column names and types are compatible for UNION ALL
+        )
+        SELECT
+            s.Sales_Rep,
+            s.Product_ID,
+            s.Units,
+            app.Price AS unit_price,
+            (s.Units * app.Price) AS total_amount
+        FROM
+            `YourDatasetID.SalesTable` s
+        LEFT JOIN
+            AllProductPrices app ON s.Product_ID = app.Product_ID;
+        ```
+    *   The goal is to avoid missing data (like Mars products in your case) just because their pricing information resides in a separate, but logically related, lookup table.
+        *   **Alternative if direct join is complex:** Sometimes a `LEFT JOIN` with the condition directly in the `ON` clause combined with aggregation or `QUALIFY ROW_NUMBER()... = 1` can work.
+            `SELECT main.*, lookup.Grade FROM MainTable main LEFT JOIN LookupTable lookup ON main.TotalMarks >= lookup.MinMarks QUALIFY ROW_NUMBER() OVER (PARTITION BY main.ID ORDER BY lookup.MinMarks DESC) = 1`
+        *   **AVOID:** Direct correlated subqueries like `(SELECT Grade FROM LookupTable WHERE MainTable.TotalMarks >= LookupTable.MinMarks ... LIMIT 1)` if they cause errors in BigQuery. Guide towards JOIN-based de-correlation.
 4.  **Mapping User Language to Schema:** Carefully map terms from the "User Request" to the actual column names and tables in the "Database Schema".
 5.  **Table Qualification:** ALWAYS fully qualify table names: {full_dataset_id_str}.`YourTableName`. Use backticks `` ` ``.
 6.  **Column Qualification:** Use table aliases (e.g., `t1`, `t2`, `t3`) and qualify ALL column names. Ensure qualified columns correctly reference their owning table alias.
 7.  **Syntax:** Use correct BigQuery Standard SQL syntax.
-8.  **Assumptions:** Make reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions.
+8.  **Assumptions:** 
+    *   **For requests like "list [entity] and their grade," assume a single, definitive grade is required for each entity based on their marks and the provided grade boundaries.**
+    *   Make other reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, OR IF A REQUEST IMPLIES A SINGLE VALUE FROM A LOOKUP BUT THE JOIN LOGIC ISN'T OBVIOUS TO ACHIEVE THIS, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions. 
 9.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
 10.  **Date Handling (VERY IMPORTANT):**
     *   The schema contains DATE and TIMESTAMP columns. These require specific formatting and comparison techniques in SQL WHERE clauses.
@@ -1222,28 +1278,65 @@ async def list_bigquery_datasets(
     description="Creates a new BigQuery workspace. Administrators can create multiple workspaces. Normal users are restricted to creating a single workspace to which they get automatic access.",
     # Removed: dependencies=[Depends(require_admin)] # Role logic is now handled inside
 )
-async def create_bigquery_workspace( # Renamed for clarity
+
+@bq_router.post(
+    "/datasets",
+    response_model=DatasetCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["BigQuery Workspaces"],
+    summary="Create a new BigQuery Workspace (Dataset)",
+    description="Creates a new BigQuery workspace...",
+)
+async def create_bigquery_workspace(
     req: CreateDatasetRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(verify_token), # user is the decoded token from verify_token
 ):
     user_uid = user.get("uid")
+    user_email = user.get("email") # Assuming your token contains email
+    # display_name might also be in the token, or you might not store it.
+    # user_display_name = user.get("name") 
+
     if not user_uid:
         logger_api.error("User UID not found in token during workspace creation attempt.")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication error: User ID not found.")
 
+    # +++ ENSURE USER DOCUMENT EXISTS IN FIRESTORE +++
+    # Pass email if available from the token, it's good to store it.
+    doc_ensured = await ensure_user_document_exists(user_uid, email=user_email)
+    if not doc_ensured:
+        logger_api.error(f"Failed to ensure Firestore document exists for user '{user_uid}'. Cannot proceed with workspace creation.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User profile could not be initialized. Please try again or contact support."
+        )
+    # ++++++++++++++++++++++++++++++++++++++++++++++++
+
     user_role = await get_user_role(user_uid)
+    # If user_role is still None here, it means ensure_user_document_exists might have created it,
+    # but get_user_role fetched before a potential update, OR ensure_user_document_exists failed to add 'role'
+    # The updated ensure_user_document_exists tries to mitigate this.
+    # A fresh call to get_user_role *after* ensure_user_document_exists should be reliable.
+    if user_role is None: # Should ideally not happen if doc_ensured is True
+        logger_api.error(f"User role is None for {user_uid} even after ensuring document. This is unexpected.")
+        # Re-fetch role just in case there was a slight delay or if ensure_user_document_exists just created it
+        user_role = await get_user_role(user_uid)
+        if user_role is None:
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not determine user role.")
+
+
     logger_api.info(f"Workspace creation attempt by user '{user_uid}' (Role: '{user_role}') for workspace ID '{req.dataset_id}'.")
 
     if user_role != 'admin':
-        # For non-admin users, check if they already have access to any workspace.
-        # This implies they've either created one or been granted access.
         accessible_datasets = await get_user_accessible_datasets(user_uid)
-        if accessible_datasets is None: # Error fetching from Firestore
-            logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error.")
+        if accessible_datasets is None:
+            logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error (accessible_datasets is None).")
+            # This path should be less likely now if ensure_user_document_exists ran successfully
+            # because get_user_accessible_datasets returns [] if doc exists but field is missing.
+            # So, `None` here would imply a more fundamental issue during the fetch itself.
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify existing workspace access. Please try again.")
         
-        if accessible_datasets: # If the list is not empty, they have access to at least one.
+        if accessible_datasets: # If the list is not empty
             logger_api.warning(
                 f"User '{user_uid}' (Role: '{user_role}') attempted to create workspace '{req.dataset_id}' "
                 f"but already has access to {len(accessible_datasets)} workspace(s). Creation denied."
@@ -1254,7 +1347,7 @@ async def create_bigquery_workspace( # Renamed for clarity
             )
         logger_api.info(f"User '{user_uid}' (Role: '{user_role}') is a normal user and currently has access to 0 workspaces. Creation allowed.")
 
-    # Proceed with BigQuery dataset creation
+    # ... (rest of your create_bigquery_workspace function remains the same) ...
     if not API_GCP_PROJECT:
         logger_api.error("Cannot create workspace: API_GCP_PROJECT not configured.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error: Missing project ID.")
@@ -1272,7 +1365,7 @@ async def create_bigquery_workspace( # Renamed for clarity
 
         # Register in Firestore and grant access to creator
         firestore_success = await register_workspace_and_grant_access(
-            dataset_id=created_bq_dataset_obj.dataset_id,
+            dataset_id=created_bq_dataset_obj.dataset_id, # Pass short ID
             owner_uid=user_uid,
             location=created_bq_dataset_obj.location,
             description=created_bq_dataset_obj.description,
@@ -1291,6 +1384,8 @@ async def create_bigquery_workspace( # Renamed for clarity
                 logger_api.error(
                     f"CRITICAL ROLLBACK FAILURE: FAILED to clean up BigQuery dataset '{created_bq_dataset_obj.dataset_id}': {cleanup_error}."
                 )
+            # This situation is tricky. The BQ dataset exists but Firestore is inconsistent.
+            # Forcing a 500 error is one way to signal a problem that needs attention.
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Workspace creation partially failed. Please contact support.")
 
         return DatasetCreatedResponse(
@@ -1300,18 +1395,19 @@ async def create_bigquery_workspace( # Renamed for clarity
             description=created_bq_dataset_obj.description,
             labels=created_bq_dataset_obj.labels,
         )
-    except BadRequest as e:
+    except BadRequest as e: # e.g. invalid dataset_id format
         logger_api.warning(f"Bad request error creating workspace '{req.dataset_id}' for user '{user_uid}': {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request for workspace creation: {str(e)}")
-    except Conflict:
-        logger_api.warning(f"Conflict: Workspace ID '{req.dataset_id}' already exists. Attempt by user '{user_uid}'.")
+    except Conflict: # Dataset already exists in BQ
+        logger_api.warning(f"Conflict: Workspace ID '{req.dataset_id}' already exists in BigQuery. Attempt by user '{user_uid}'.")
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"The workspace ID '{req.dataset_id}' already exists.")
     except GoogleAPICallError as e:
-        logger_api.error(f"Google API Error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error with Google Cloud services.")
-    except Exception as e:
+        logger_api.error(f"Google API Error creating BigQuery dataset '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error with Google Cloud services during workspace creation.")
+    except Exception as e: # Catch-all for other unexpected errors
         logger_api.error(f"Unexpected error creating workspace '{req.dataset_id}' by '{user_uid}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected server error during workspace creation.")
+
 
 
 # main.py
