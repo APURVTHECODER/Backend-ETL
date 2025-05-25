@@ -41,6 +41,11 @@ spec:
               configMapKeyRef:
                 name: app-config
                 key: pubsub.subscription
+          - name: VITE_API_BASE_URL # Worker's etl.py will read this
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: VITE_API_BASE_URL # Key name must match what's in app-config
           - name: GOOGLE_APPLICATION_CREDENTIALS # Python code might read this var name
             valueFrom:
               secretKeyRef:

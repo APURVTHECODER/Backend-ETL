@@ -101,7 +101,7 @@ def extract_fully_qualified_tables(sql: str) -> List[str]:
     return original_case_tables
 
 # --- MODIFIED HELPER to accept bq_client ---
-async def fetch_bq_data_to_dataframe(
+def fetch_bq_data_to_dataframe(
     query: str,
     location: Optional[str], # Location might be needed for the query job config
     bq_client: bigquery.Client # Accept the initialized client
@@ -181,7 +181,7 @@ def make_datetime_naive(df: pd.DataFrame) -> pd.DataFrame:
                         },
                         # ... other responses
                     })
-async def export_query_to_excel( # Renamed to match your previous working one
+def export_query_to_excel( # Renamed to match your previous working one
     payload: QueryToExcelRequest, # Use the Pydantic model that includes chart fields
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ):
@@ -286,7 +286,7 @@ async def export_query_to_excel( # Renamed to match your previous working one
             logger_export.info(f"Fetching preview for source table: {table_fqn} (Limit: {MAX_SOURCE_TABLE_ROWS})")
             preview_query = f"SELECT * FROM `{table_fqn}` LIMIT {MAX_SOURCE_TABLE_ROWS}"
             
-            df_source_preview = await fetch_bq_data_to_dataframe(preview_query, payload.location, bq_client)
+            df_source_preview = fetch_bq_data_to_dataframe(preview_query, payload.location, bq_client)
             df_source_preview_naive = make_datetime_naive(df_source_preview.copy()) # Ensure naive datetimes
 
             base_table_name = table_fqn.split('.')[-1]

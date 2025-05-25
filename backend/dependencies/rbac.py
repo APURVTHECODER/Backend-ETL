@@ -7,7 +7,7 @@ from services.firestore_service import get_user_role
 
 logger_rbac = logging.getLogger(__name__ + "_rbac")
 
-async def require_admin(user: dict = Depends(verify_token)) -> dict:
+def require_admin(user: dict = Depends(verify_token)) -> dict:
     """
     Dependency that requires the user to have the 'admin' role in Firestore.
     """
@@ -19,7 +19,7 @@ async def require_admin(user: dict = Depends(verify_token)) -> dict:
             detail="Could not validate user identity for permission check.",
         )
 
-    user_role = await get_user_role(user_uid)
+    user_role = get_user_role(user_uid)
 
     if user_role != "admin":
         logger_rbac.warning(f"Permission denied for UID {user_uid}. Role found: '{user_role}'. Required: 'admin'.")

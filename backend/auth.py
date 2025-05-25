@@ -76,7 +76,7 @@ initialize_firebase_admin()
 # --- FastAPI Dependency for Authentication ---
 oauth2_scheme = HTTPBearer()
 
-async def get_current_user(token_cred: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> Dict[str, Any]:
+def get_current_user(token_cred: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> Dict[str, Any]:
     """ 
     FastAPI dependency to verify Firebase ID token, ensure Firestore user document, 
     and return user claims. 
@@ -114,7 +114,7 @@ async def get_current_user(token_cred: HTTPAuthorizationCredentials = Depends(oa
 
         # +++ ENSURE FIRESTORE DOCUMENT FOR THE AUTHENTICATED USER +++
         logger_auth.info(f"Token verified for UID: {uid}. Ensuring Firestore document.")
-        doc_ensured = await ensure_user_document_exists(uid, email=email, display_name=display_name)
+        doc_ensured = ensure_user_document_exists(uid, email=email, display_name=display_name)
         
         if not doc_ensured:
             # This is a critical failure if we can't even ensure the doc.
@@ -163,7 +163,7 @@ async def get_current_user(token_cred: HTTPAuthorizationCredentials = Depends(oa
 
 # --- verify_token function ---
 # Ensure firebase_app is checked here too, or rely on get_current_user's check if always used together
-async def verify_token(current_user_data: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+def verify_token(current_user_data: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """ 
     Verifies token and ensures user document. Used as a primary dependency for protected routes.
     Relies on get_current_user for the actual verification and Firestore document ensuring.
