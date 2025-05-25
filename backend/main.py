@@ -92,7 +92,7 @@ def startup_event():
     logger_api.info("Startup pre-initialization complete.")
 
 
-
+FEEDBACK_GCS_BUCKET=os.getenv("FEEDBACK_BUCKET")
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logger_api.info(f"CORS enabled for origins: {allowed_origins}")
@@ -104,6 +104,19 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     original_file_name: str = Field(..., description="The original name of the file uploaded by the user")
     is_multi_header: Optional[bool] = Field(default=False)
     header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
+
+
+class FeedbackImageUploadUrlRequest(BaseModel):
+    filename: str = Field(..., description="The original name of the image file.")
+    content_type: str = Field(..., description="The MIME type of the image (e.g., image/jpeg, image/png).")
+    # You could add user_uid here if you want to make the GCS path user-specific,
+    # but it's also available from the token in the endpoint.
+
+class FeedbackImageUploadUrlResponse(BaseModel):
+    upload_url: str
+    gcs_object_name: str # The full path in GCS where the file will be stored
+    # You could also return a public_url if your bucket/objects are public and you construct it
+
 
 # Payload for the Pub/Sub message (sent to the ETL worker)
 class ETLRequestPubSubPayload(BaseModel):
@@ -139,6 +152,7 @@ class FeedbackSubmission(BaseModel):
     user_description: str = Field(..., min_length=10) # Make description mandatory and have min length
     user_corrected_sql: Optional[str] = None
     page_context: Optional[str] = None # e.g., "/explorer", "/upload"
+    image_urls: Optional[List[str]] = None 
     # user_id will be extracted from the token on the backend
     # timestamp will be added by the backend
 
@@ -1926,11 +1940,69 @@ def get_user_active_etl_batches(current_user: dict = Depends(verify_token)):
 
 
 
+# If you want to keep feedback related things together, add to feedback_router
+# Otherwise, it can be directly under app or its own router.
+# For this example, let's add it under a general app path or a new utility router.
+
+
+
+
+# Inside main.py
+
+@app.get( 
+    "/api/feedback-image-upload-url",
+    response_model=FeedbackImageUploadUrlResponse,
+    tags=["Feedback Utilities"], 
+    dependencies=[Depends(verify_token)] 
+)
+def get_feedback_image_upload_url(
+    filename: str = Query(..., description="The original name of the image file."), # Get as query param
+    content_type: str = Query(..., description="The MIME type of the image (e.g., image/jpeg)."), # Get as query param
+    current_user: dict = Depends(verify_token),
+    storage_client: storage.Client = Depends(get_storage_client) 
+):
+    user_uid = current_user.get("uid")
+    if not user_uid: # Should be caught by verify_token
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
+
+    if not FEEDBACK_GCS_BUCKET: 
+        logger_api.error("Cannot generate feedback image upload URL: API_GCS_BUCKET not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server storage configuration error.")
+
+    # Sanitize filename received from query parameter
+    clean_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
+    
+    gcs_object_name = f"feedback_attachments/{user_uid}/{uuid.uuid4()}_{clean_filename}"
+
+    try:
+        bucket = storage_client.bucket(FEEDBACK_GCS_BUCKET) 
+        blob = bucket.blob(gcs_object_name)
+
+        upload_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15), 
+            method="PUT",
+            content_type=content_type, # Use content_type from query parameter
+        )
+        
+        logger_api.info(f"Generated signed URL for feedback image: {gcs_object_name} for user {user_uid}")
+        return FeedbackImageUploadUrlResponse(
+            upload_url=upload_url,
+            gcs_object_name=gcs_object_name
+        )
+    except Exception as e:
+        logger_api.error(f"Error generating signed URL for feedback image {filename} for user {user_uid}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate image upload URL.")
+
+
+# main.py
+# ...
+# feedback_router = APIRouter(...) # Assuming you have this defined
 
 @feedback_router.post("/", response_model=FeedbackResponse, status_code=status.HTTP_201_CREATED)
 def submit_user_feedback(
     feedback_submission: FeedbackSubmission,
-    current_user: Dict[str, Any] = Depends(verify_token) # verify_token ensures user_id
+    current_user: Dict[str, Any] = Depends(verify_token) # verify_token provides user_uid
 ):
     user_uid = current_user.get("uid")
     if not user_uid:
@@ -1938,17 +2010,37 @@ def submit_user_feedback(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
 
     logger_api.info(f"Received feedback submission from user: {user_uid}, type: {feedback_submission.feedback_type}")
+    
+    # feedback_submission.model_dump(exclude_none=True) will include 'image_urls' if present in the request.
+    # Your store_feedback service needs to be able to handle this list of URLs.
+    feedback_data_to_store = feedback_submission.model_dump(exclude_none=True)
+    
+    logger_api.debug(f"Data being passed to store_feedback: {feedback_data_to_store}")
 
-    feedback_id = store_feedback(user_uid, feedback_submission.model_dump(exclude_none=True))
+    # Ensure your store_feedback service can handle the 'image_urls' field
+    # and save it appropriately (e.g., as an array in Firestore).
+    feedback_id = store_feedback(user_uid, feedback_data_to_store)
 
     if feedback_id:
         return FeedbackResponse(message="Feedback submitted successfully.", feedback_id=feedback_id)
     else:
+        # This could happen if store_feedback returns None or raises an exception
+        logger_api.error(f"Failed to store feedback for user {user_uid}. store_feedback returned no ID.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not store feedback at this time. Please try again later."
         )
-    
+
+# ...
+
+
+
+# app.include_router(feedback_router) # Make sure router is included
+
+
+
+
+
 
 # --- Include Routers ---
 app.include_router(bq_router)

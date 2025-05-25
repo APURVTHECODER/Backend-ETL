@@ -31,6 +31,11 @@ spec:
               configMapKeyRef:
                 name: app-config
                 key: gcs.bucket
+          - name: FEEDBACK_BUCKET
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: gcs.bucketfeedback
           - name: BQ_DATASET
             valueFrom:
               configMapKeyRef:
