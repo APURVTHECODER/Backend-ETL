@@ -15,12 +15,18 @@ from routers.chatbot import chat_router
 from auth import get_current_user, verify_token
 # FastAPI and Pydantic
 import base64
+from google.cloud.firestore_v1.base_query import FieldFilter # Keep this
 from clients import initialize_google_clients, initialize_gemini, _cleanup_temp_cred_file_clients # +++ MODIFIED +++
-from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path , status,Response
+from fastapi import FastAPI, HTTPException, Request, APIRouter, Depends, Query, Path , status,Response,BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse # Keep if used later
 from pydantic import BaseModel, Field,conint
 import json
+from services.etl_status_service import (
+    initialize_batch_status_in_firestore,
+    update_file_status_in_firestore,
+    ETL_BATCHES_COLLECTION # If you need to refer to the collection name directly
+)
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
 from google.cloud.exceptions import NotFound, BadRequest , Conflict
@@ -28,8 +34,9 @@ from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
-from services.firestore_service import initialize_firestore,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore,ensure_user_document_exists   # Import initializer
+from services.firestore_service import initialize_firestore,get_firestore_client,get_user_accessible_datasets,get_user_role,register_workspace_and_grant_access,remove_workspace_from_firestore,ensure_user_document_exists   # Import initializer
 from dependencies.rbac import require_admin # Import RBAC dependency
+from services.firestore_service import db
 from routers.user_profile import user_profile_router # Import new router
 from config import ( # Import config VARIABLES
     API_GCP_PROJECT, API_GCS_BUCKET, API_PUBSUB_TOPIC, API_CREDENTIALS_PATH,
@@ -42,6 +49,8 @@ from dependencies.client_deps import (
     get_pubsub_publisher,
     get_pubsub_topic_path
 )
+from pydantic import BaseModel, Field, conint
+from services.etl_status_service import WorkerFileCompletionPayload
 # Utilities
 from dotenv import load_dotenv
 import pandas as pd
@@ -70,11 +79,10 @@ logger_api.info("FastAPI application starting...")
 
 
 @app.on_event("startup")
-async def startup_event():
+def startup_event():
     logger_api.info("Running startup event: Initializing Gemini and ensuring credentials setup...")
     # Initialize Gemini directly if needed globally
     initialize_gemini()
-    from services.firestore_service import initialize_firestore
     initialize_firestore()
     # We still call initialize_google_clients to ensure the temp file
     # and environment variable are set up correctly before the first request.
@@ -84,11 +92,50 @@ async def startup_event():
     logger_api.info("Startup pre-initialization complete.")
 
 
-
+FEEDBACK_GCS_BUCKET=os.getenv("FEEDBACK_BUCKET")
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logger_api.info(f"CORS enabled for origins: {allowed_origins}")
 
+# Payload from Frontend to initiate an ETL process for ONE file
+class SingleFileETLTriggerClientPayload(BaseModel):
+    object_name: str = Field(..., description="GCS object name, including any prefix like 'dataset_prefix/filename.xlsx'")
+    target_dataset_id: str = Field(..., description="Target BigQuery dataset (short ID, not project.dataset)")
+    original_file_name: str = Field(..., description="The original name of the file uploaded by the user")
+    is_multi_header: Optional[bool] = Field(default=False)
+    header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
+
+
+class FeedbackImageUploadUrlRequest(BaseModel):
+    filename: str = Field(..., description="The original name of the image file.")
+    content_type: str = Field(..., description="The MIME type of the image (e.g., image/jpeg, image/png).")
+    # You could add user_uid here if you want to make the GCS path user-specific,
+    # but it's also available from the token in the endpoint.
+
+class FeedbackImageUploadUrlResponse(BaseModel):
+    upload_url: str
+    gcs_object_name: str # The full path in GCS where the file will be stored
+    # You could also return a public_url if your bucket/objects are public and you construct it
+
+
+# Payload for the Pub/Sub message (sent to the ETL worker)
+class ETLRequestPubSubPayload(BaseModel):
+    object_name: str
+    target_dataset_id: str
+    is_multi_header: Optional[bool]
+    header_depth: Optional[int]
+    batch_id: str             # UUID for the batch this file belongs to
+    file_id: str              # UUID for this specific file processing task
+    original_file_name: str
+
+# Payload from ETL Worker to report file completion status
+class WorkerFileCompletionPayload(BaseModel):
+    batch_id: str
+    file_id: str
+    original_file_name: str # For logging/verification
+    success: bool
+    error_message: Optional[str] = None
+    # Optional: You could add more details like num_tables_processed, bq_table_ids, etc.
 # --- Pydantic Models ---
 # --- Pydantic Models for Prompt Suggestion ---
 class FeedbackSubmission(BaseModel):
@@ -105,6 +152,7 @@ class FeedbackSubmission(BaseModel):
     user_description: str = Field(..., min_length=10) # Make description mandatory and have min length
     user_corrected_sql: Optional[str] = None
     page_context: Optional[str] = None # e.g., "/explorer", "/upload"
+    image_urls: Optional[List[str]] = None 
     # user_id will be extracted from the token on the backend
     # timestamp will be added by the backend
 
@@ -225,7 +273,7 @@ SCHEMA_CACHE_EXPIRY_SECONDS = 3600 # 1 hour
 
 
 
-async def get_dataset_schema(dataset_id: str, bq_client: bigquery.Client) -> List[TableSchema]:
+def get_dataset_schema(dataset_id: str, bq_client: bigquery.Client) -> List[TableSchema]:
     """Fetches schema for all tables in a dataset."""
     # if not api_bigquery_client:
     #     raise HTTPException(status_code=503, detail="BigQuery client not available.")
@@ -265,7 +313,7 @@ async def get_dataset_schema(dataset_id: str, bq_client: bigquery.Client) -> Lis
 
 
 @bq_router.get("/schema", response_model=SchemaResponse)
-async def get_bigquery_dataset_schema_endpoint( # Renamed function
+def get_bigquery_dataset_schema_endpoint( # Renamed function
     dataset_id: str = Query(..., description="Full dataset ID (e.g., project.dataset)"),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
@@ -273,7 +321,7 @@ async def get_bigquery_dataset_schema_endpoint( # Renamed function
     # Consider adding caching here later for performance (e.g., using Redis or in-memory cache)
     try:
         # table_schemas = get_dataset_schema(dataset_id)
-        table_schemas = await get_dataset_schema(dataset_id, bq_client) # Pass client
+        table_schemas = get_dataset_schema(dataset_id, bq_client) # Pass client
         return SchemaResponse(dataset_id=dataset_id, tables=table_schemas)
     except HTTPException as http_exc: raise http_exc
     except Exception as e: logger_api.error(f"Schema endpoint error: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"Failed schema retrieval: {str(e)}")
@@ -286,7 +334,7 @@ async def get_bigquery_dataset_schema_endpoint( # Renamed function
     #     raise HTTPException(status_code=500, detail=f"Failed to retrieve schema: {str(e)}")
 
 @bq_router.post("/nl2sql", response_model=NLQueryResponse)
-async def natural_language_to_sql(
+def natural_language_to_sql(
     req: NLQueryRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
@@ -308,7 +356,7 @@ async def natural_language_to_sql(
 
     try:
         # 1. Fetch the *full* schema for the dataset first
-        all_table_schemas_full = await get_dataset_schema(req.dataset_id, bq_client)
+        all_table_schemas_full = get_dataset_schema(req.dataset_id, bq_client)
         if not all_table_schemas_full:
             raise HTTPException(404, f"No schema found or dataset empty: {req.dataset_id}.")
 
@@ -537,7 +585,7 @@ Generated BigQuery SQL Query:
 
         # 5. Call Gemini API (Unchanged)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        response = await model.generate_content_async(
+        response = model.generate_content(
              prompt_template,
              generation_config=genai.types.GenerationConfig(temperature=0.15), # Slightly higher temp
              request_options={'timeout': GEMINI_REQUEST_TIMEOUT}
@@ -583,7 +631,7 @@ Generated BigQuery SQL Query:
 # --- Other Endpoints ---
 # (Keep /jobs, /tables, /table-data, /jobs/{job_id}, /jobs/{job_id}/results, /api/upload-url, /api/trigger-etl, /api/health, / EXACTLY as they were)
 @bq_router.post("/jobs", response_model=JobSubmitResponse, status_code=202)
-async def submit_bigquery_job(
+def submit_bigquery_job(
     req: QueryRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
@@ -607,7 +655,7 @@ async def submit_bigquery_job(
 
 
 @bq_router.get("/tables", response_model=List[TableListItem])
-async def list_bigquery_tables(
+def list_bigquery_tables(
     dataset_id: str = Query(..., description="Full dataset ID"),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
 ):
@@ -630,7 +678,7 @@ async def list_bigquery_tables(
 
 
 @bq_router.get("/table-data", response_model=TableDataResponse)
-async def get_table_data(
+def get_table_data(
     dataset_id: str = Query(..., description="Full dataset ID"),
     table_id: str = Query(..., description="Table name"),
     page: int = Query(1, ge=1),
@@ -665,7 +713,7 @@ async def get_table_data(
 #     initialize_firestore()
 
 @bq_router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_bigquery_job_status(
+def get_bigquery_job_status(
     job_id: str = Path(...),
     location: str = Query(DEFAULT_BQ_LOCATION),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
@@ -701,7 +749,7 @@ async def get_bigquery_job_status(
 
 
 @bq_router.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
-async def get_bigquery_job_results(
+def get_bigquery_job_results(
     job_id: str = Path(...),
     location: str = Query(DEFAULT_BQ_LOCATION),
     page_token: Optional[str] = Query(None),
@@ -737,7 +785,7 @@ async def get_bigquery_job_results(
 
 # --- Upload/ETL Endpoints ---
 @app.get("/api/upload-url", tags=["Upload"], dependencies=[Depends(verify_token)])
-async def get_upload_url(
+def get_upload_url(
     filename: str = Query(..., description="Name of the file to upload."),
     dataset_id: str = Query(..., description="Target dataset ID"),
     storage_client: storage.Client = Depends(get_storage_client) # Inject storage client
@@ -776,13 +824,26 @@ async def get_upload_url(
     # except NotFound: logger_api.error(f"GCS Bucket not found: {API_GCS_BUCKET}"); raise HTTPException(404, f"GCS Bucket '{API_GCS_BUCKET}' not found.")
     # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename} (dataset: {dataset_id}): {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
 
-@app.post("/api/trigger-etl", tags=["ETL"], dependencies=[Depends(verify_token)])
-async def trigger_etl(
-    payload: ETLRequest,
-    request: Request, # Keep if needed for client_ip logging
-    publisher: pubsub_v1.PublisherClient = Depends(get_pubsub_publisher), # Inject publisher
-    topic_path: str = Depends(get_pubsub_topic_path) # Inject topic path
+@app.post("/api/trigger-etl", response_model=Dict[str, Any], tags=["ETL"], dependencies=[Depends(verify_token)])
+def trigger_etl(
+    payload: SingleFileETLTriggerClientPayload, # No default (from request body)
+    request: Request,                           # No default (FastAPI provided)
+    background_tasks: BackgroundTasks,          # No default (FastAPI provided)
+    current_user: dict = Depends(verify_token),
+    publisher: pubsub_v1.PublisherClient = Depends(get_pubsub_publisher),
+    topic_path: str = Depends(get_pubsub_topic_path)                   # Has default
 ):
+    """
+    Triggers the ETL process for a single file, initializes batch tracking in Firestore,
+    and publishes a message to Pub/Sub for the worker.
+    """
+    user_uid = current_user.get("uid")
+    if not user_uid:
+        logger_api.error("User not authenticated in trigger_etl.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
+    
+
+
     # logger_api.info(f"[DEBUG] /api/trigger-etl received payload: {payload.dict()}")
     # if not api_publisher or not api_topic_path: logger_api.error("Cannot trigger ETL: Publisher client not available."); raise HTTPException(503, "Messaging service unavailable")
     #if not payload.object_name or not payload.object_name.startswith("uploads/"): logger_api.warning(f"Invalid object_name received for ETL trigger: {payload.object_name}"); raise HTTPException(400, "Invalid object_name provided. Must start with 'uploads/'.")
@@ -795,40 +856,109 @@ async def trigger_etl(
     """Triggers the ETL process by publishing a message to Pub/Sub."""
     if not payload.object_name or not payload.target_dataset_id: raise HTTPException(400, "Invalid payload.")
     if payload.is_multi_header and payload.header_depth is None:
-        raise HTTPException(400, "Invalid payload: header_depth is required when is_multi_header is true.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="header_depth is required when is_multi_header is true.")
     if not payload.is_multi_header and payload.header_depth is not None:
-        logger_api.warning(f"header_depth provided for {payload.object_name} but is_multi_header is false. header_depth will be ignored.")
-        # Optionally, you could nullify it: payload.header_depth = None
-    # +++ END VALIDATION +++
-    client_ip = request.client.host if request.client else "unknown"
-    logger_api.info(f"Triggering ETL for: {payload.object_name} from {client_ip}")
+        logger_api.warning(
+            f"header_depth provided for GCS object {payload.object_name} "
+            f"by user {user_uid}, but is_multi_header is false. header_depth will be ignored by worker."
+        )
+        # payload.header_depth = None # Optionally nullify it before sending to worker
+
+    client_ip = request.client.host if request.client else "unknown_ip" # 'request' is now correctly placed
+    logger_api.info(f"User {user_uid} ({client_ip}) triggering ETL for: {payload.original_file_name} -> GCS: {payload.object_name}")
+
+    # Prepare file detail for Firestore batch initialization
+    file_detail_for_batch_init = {
+        "original_file_name": payload.original_file_name,
+        "gcs_object_name": payload.object_name,
+        "is_multi_header": payload.is_multi_header,
+        "header_depth": payload.header_depth
+    }
+
+    batch_init_response = initialize_batch_status_in_firestore(user_uid, [file_detail_for_batch_init])
+
+    if not batch_init_response or "batch_id" not in batch_init_response or "file_ids_map" not in batch_init_response:
+        logger_api.error(f"Failed to initialize Firestore batch tracking for user {user_uid}, file {payload.original_file_name}.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initialize ETL batch tracking.")
+
+    batch_id = batch_init_response["batch_id"]
+    file_id = batch_init_response["file_ids_map"].get(payload.original_file_name)
+
+    if not file_id: 
+        logger_api.error(f"Critical error: File ID not found for {payload.original_file_name} in batch {batch_id} after Firestore initialization.")
+        try:
+            get_firestore_client().collection(ETL_BATCHES_COLLECTION).document(batch_id).update({
+             "overallBatchStatus": "error_internal",
+             "internalErrorMessage": "Failed to retrieve file_id post-initialization."
+         })
+        except Exception as fs_clean_err:
+            logger_api.error(f"Failed to mark batch {batch_id} as errored after file_id retrieval failure: {fs_clean_err}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error creating file tracking ID.")
+
+    pubsub_message_payload = ETLRequestPubSubPayload(
+        object_name=payload.object_name,
+        target_dataset_id=payload.target_dataset_id,
+        is_multi_header=payload.is_multi_header,
+        header_depth=payload.header_depth,
+        batch_id=batch_id,
+        file_id=file_id,
+        original_file_name=payload.original_file_name
+    )
+    message_data_dict = pubsub_message_payload.model_dump()
+    data_bytes = json.dumps(message_data_dict).encode("utf-8")
     try:
-        # message_data = { "object_name": payload.object_name, "target_dataset_id": payload.target_dataset_id }
-        # data = json.dumps(message_data).encode("utf-8") # Sends the JSON string encoded
-        # future = api_publisher.publish(api_topic_path, data=data)
-        message_data = payload.dict()
-        data = json.dumps(message_data).encode("utf-8")
-        future = publisher.publish(topic_path, data=data) # Use injected client & path
-        def pubsub_callback(f):
-             try: message_id = f.result(); logger_api.info(f"Pub/Sub message published successfully for {payload.object_name}. Message ID: {message_id}")
-             except Exception as pub_e: logger_api.error(f"Failed to publish Pub/Sub message for {payload.object_name}: {pub_e}", exc_info=True)
-        future.add_done_callback(pubsub_callback)
-        logger_api.info(f"ETL job queued successfully for {payload.object_name}")
-        return {"status": "queued", "object_name": payload.object_name}
-    except TimeoutError:
-        logger_api.error(f"Timeout publishing ETL trigger for {payload.object_name} to Pub/Sub.")
-        raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, detail="Timeout communicating with messaging service.")
-    except GoogleAPICallError as e: logger_api.error(f"PubSub API Error trigger ETL: {e}"); raise HTTPException(502, f"PubSub API Error: {str(e)}")
-    except Exception as e: logger_api.error(f"Trigger ETL error: {e}"); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
-    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with Pub/Sub API: {str(e)}")
-    # except Exception as e: logger_api.error(f"Error publishing ETL trigger for {payload.object_name} to Pub/Sub: {e}", exc_info=True); raise HTTPException(500, f"Could not trigger ETL: {str(e)}")
+        future = publisher.publish(topic_path, data=data_bytes)
+        logger_api.debug(f"Pub/Sub message publish initiated for batch {batch_id}, file {file_id}.")
+        def pubsub_result_callback(f):
+            try:
+                message_id_published = f.result() 
+                logger_api.info(
+                    f"Pub/Sub message published successfully for Batch: {batch_id}, FileID: {file_id}, "
+                    f"OriginalName: {payload.original_file_name}. Pub/Sub Message ID: {message_id_published}."
+                    f"Payload: {message_data_dict}"
+                )
+            except Exception as pub_e_fail:
+                logger_api.error(f"Pub/Sub publish FAILED for Batch: {batch_id}, FileID: {file_id}: {pub_e_fail}", exc_info=True)
+                error_payload_for_firestore = WorkerFileCompletionPayload(
+                    batch_id=batch_id,
+                    file_id=file_id,
+                    original_file_name=payload.original_file_name,
+                    success=False,
+                    error_message="Failed to queue for processing (Pub/Sub publish error)."
+                )
+                background_tasks.add_task(update_file_status_in_firestore, error_payload_for_firestore) # 'background_tasks' is now correctly placed
+
+        future.add_done_callback(pubsub_result_callback)
+
+        get_firestore_client().collection(ETL_BATCHES_COLLECTION).document(batch_id).update({
+             f"files.{file_id}.status": "triggered_to_worker",
+             f"files.{file_id}.lastUpdated": datetime.now(timezone.utc).isoformat()
+         })
+
+        logger_api.info(f"ETL job triggered and Firestore status updated for {payload.original_file_name} (Batch: {batch_id}, File: {file_id})")
+        return {"status": "queued", "object_name": payload.object_name, "batch_id": batch_id, "file_id": file_id}
+
+    except Exception as e: 
+        logger_api.error(f"Error during Pub/Sub publish or Firestore update for {payload.original_file_name} (Batch {batch_id}): {e}", exc_info=True)
+        if batch_id and file_id: 
+            error_payload = WorkerFileCompletionPayload(
+                batch_id=batch_id,
+                file_id=file_id, 
+                original_file_name=payload.original_file_name,
+                success=False,
+                error_message=f"API error during trigger: {str(e)}"
+            )
+            background_tasks.add_task(update_file_status_in_firestore, error_payload)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not fully trigger ETL processing: {str(e)}")
+
+
 
 
 
 
 # --- Optional Health Check ---
 @app.get("/api/health", tags=["Health"])
-async def health_check( # Inject clients to check their status
+def health_check( # Inject clients to check their status
     bq_client: Optional[bigquery.Client] = Depends(get_bigquery_client, use_cache=False),
     storage_client: Optional[storage.Client] = Depends(get_storage_client, use_cache=False),
     publisher: Optional[pubsub_v1.PublisherClient] = Depends(get_pubsub_publisher, use_cache=False)
@@ -884,7 +1014,7 @@ class SuggestVizResponse(BaseModel):
 
 # +++ NEW ENDPOINT: /summarize-results +++
 @bq_router.post("/summarize-results", response_model=AISummaryResponse)
-async def summarize_results(req: AISummaryRequest):
+def summarize_results(req: AISummaryRequest):
     """Generates a natural language summary of query results using Gemini."""
     if not GEMINI_API_KEY:
         logger_api.warning("AI Summary requested but Gemini API key not set.")
@@ -949,13 +1079,11 @@ Summary of Findings:
 
         # --- Call Gemini API ---
         model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or another suitable model
-        response = await model.generate_content_async(
-             summary_prompt,
-             # Use a moderate temperature for informative summary
-             generation_config=genai.types.GenerationConfig(temperature=0.4),
-             # Timeout might need adjustment depending on complexity
-             request_options={'timeout': GEMINI_REQUEST_TIMEOUT}
-         )
+        response = model.generate_content( # REMOVE _async
+            summary_prompt,
+            generation_config=genai.types.GenerationConfig(temperature=0.15), # Slightly higher temp
+            request_options={'timeout': GEMINI_REQUEST_TIMEOUT}
+        )
 
         # --- Process Response ---
         logger_api.debug(f"Gemini Raw Summary Response: {response.text}")
@@ -982,7 +1110,7 @@ Summary of Findings:
 
 
 @bq_router.post("/suggest-visualization", response_model=SuggestVizResponse)
-async def suggest_visualization(req: SuggestVizRequest):
+def suggest_visualization(req: SuggestVizRequest):
     """Suggests appropriate visualizations based on query results schema and context."""
 
     if not GEMINI_API_KEY:
@@ -1071,7 +1199,7 @@ async def suggest_visualization(req: SuggestVizRequest):
                 temperature=0.2
             )
          )
-        response = await model.generate_content_async(
+        response = model.generate_content(
              prompt_context,
              # Set a reasonable timeout, maybe shorter than regular queries
             request_options={'timeout': int(os.getenv("GEMINI_TIMEOUT_SECONDS", 120)) // 2}
@@ -1079,8 +1207,6 @@ async def suggest_visualization(req: SuggestVizRequest):
 
         logger_api.debug(f"Gemini Raw Viz Suggestion Response Text: {response.text}")
 
-        # Inner try block for JSON parsing
-        import json # Ensure json is imported
         try:
             # Clean potential markdown ```json ... ``` artifacts if the model doesn't strictly adhere
             cleaned_response = response.text.strip()
@@ -1152,7 +1278,7 @@ async def suggest_visualization(req: SuggestVizRequest):
 
 
 @bq_router.get("/datasets", response_model=DatasetListResponse, tags=["BigQuery"])
-async def list_bigquery_datasets(
+def list_bigquery_datasets(
     user: dict = Depends(verify_token),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
     # filter_label: Optional[str] = Query(None, description="Filter datasets by label (e.g., 'env:prod')")
@@ -1179,7 +1305,7 @@ async def list_bigquery_datasets(
     logger_api.info(f"Listing BigQuery datasets for project: {API_GCP_PROJECT}")
     # datasets_list: List[DatasetListItemModel] = []
     try:
-        user_role = await get_user_role(user_uid)
+        user_role = get_user_role(user_uid)
         logger_api.info(f"User {user_uid} role determined as: {user_role}")
         # list_datasets returns an iterator of google.cloud.bigquery.DatasetListItem
         # datasets_list: List[DatasetListItemModel] = []
@@ -1222,7 +1348,7 @@ async def list_bigquery_datasets(
 # ...
         else: # Not admin
             logger_api.info(f"User {user_uid} is not admin. Fetching accessible datasets from Firestore.")
-            accessible_dataset_ids = await get_user_accessible_datasets(user_uid)
+            accessible_dataset_ids = get_user_accessible_datasets(user_uid)
 
             if accessible_dataset_ids is None:
                 logger_api.warning(f"Could not determine accessible datasets for user {user_uid}. Returning empty list.")
@@ -1321,7 +1447,7 @@ async def list_bigquery_datasets(
     summary="Create a new BigQuery Workspace (Dataset)",
     description="Creates a new BigQuery workspace...",
 )
-async def create_bigquery_workspace(
+def create_bigquery_workspace(
     req: CreateDatasetRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client),
     user: dict = Depends(verify_token), # user is the decoded token from verify_token
@@ -1337,7 +1463,7 @@ async def create_bigquery_workspace(
 
     # +++ ENSURE USER DOCUMENT EXISTS IN FIRESTORE +++
     # Pass email if available from the token, it's good to store it.
-    doc_ensured = await ensure_user_document_exists(user_uid, email=user_email)
+    doc_ensured =  ensure_user_document_exists(user_uid, email=user_email)
     if not doc_ensured:
         logger_api.error(f"Failed to ensure Firestore document exists for user '{user_uid}'. Cannot proceed with workspace creation.")
         raise HTTPException(
@@ -1346,7 +1472,7 @@ async def create_bigquery_workspace(
         )
     # ++++++++++++++++++++++++++++++++++++++++++++++++
 
-    user_role = await get_user_role(user_uid)
+    user_role =  get_user_role(user_uid)
     # If user_role is still None here, it means ensure_user_document_exists might have created it,
     # but get_user_role fetched before a potential update, OR ensure_user_document_exists failed to add 'role'
     # The updated ensure_user_document_exists tries to mitigate this.
@@ -1354,7 +1480,7 @@ async def create_bigquery_workspace(
     if user_role is None: # Should ideally not happen if doc_ensured is True
         logger_api.error(f"User role is None for {user_uid} even after ensuring document. This is unexpected.")
         # Re-fetch role just in case there was a slight delay or if ensure_user_document_exists just created it
-        user_role = await get_user_role(user_uid)
+        user_role =  get_user_role(user_uid)
         if user_role is None:
              raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not determine user role.")
 
@@ -1362,7 +1488,7 @@ async def create_bigquery_workspace(
     logger_api.info(f"Workspace creation attempt by user '{user_uid}' (Role: '{user_role}') for workspace ID '{req.dataset_id}'.")
 
     if user_role != 'admin':
-        accessible_datasets = await get_user_accessible_datasets(user_uid)
+        accessible_datasets =  get_user_accessible_datasets(user_uid)
         if accessible_datasets is None:
             logger_api.error(f"Could not verify workspace access for user '{user_uid}' due to Firestore error (accessible_datasets is None).")
             # This path should be less likely now if ensure_user_document_exists ran successfully
@@ -1398,7 +1524,7 @@ async def create_bigquery_workspace(
         logger_api.info(f"User '{user_uid}' successfully created BigQuery dataset: {created_bq_dataset_obj.full_dataset_id}")
 
         # Register in Firestore and grant access to creator
-        firestore_success = await register_workspace_and_grant_access(
+        firestore_success =  register_workspace_and_grant_access(
             dataset_id=created_bq_dataset_obj.dataset_id, # Pass short ID
             owner_uid=user_uid,
             location=created_bq_dataset_obj.location,
@@ -1456,7 +1582,7 @@ async def create_bigquery_workspace(
     # Removed: dependencies=[Depends(require_admin)], # RBAC is handled inside
     # ... (responses remain the same) ...
 )
-async def delete_bigquery_table(
+def delete_bigquery_table(
     dataset_id_only: str = Path(..., description="The ID of the workspace (dataset name only)."),
     table_id: str = Path(..., description="The ID of the table to delete."),
     user: dict = Depends(verify_token), # Get current user
@@ -1471,13 +1597,13 @@ async def delete_bigquery_table(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error.")
 
     # Check user's role and access
-    user_role = await get_user_role(user_uid)
+    user_role =  get_user_role(user_uid)
     can_delete = False
     if user_role == 'admin':
         can_delete = True
         logger_api.info(f"Admin '{user_uid}' attempting to delete table '{table_id}' from workspace '{dataset_id_only}'.")
     else: # Normal user
-        accessible_datasets = await get_user_accessible_datasets(user_uid)
+        accessible_datasets =  get_user_accessible_datasets(user_uid)
         if accessible_datasets is None: # Firestore error
              logger_api.error(f"User '{user_uid}': Could not verify access to workspace '{dataset_id_only}' for table deletion due to Firestore error.")
              raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify workspace access.")
@@ -1521,7 +1647,7 @@ async def delete_bigquery_table(
 
 
 @bq_router.post("/suggest-prompt", response_model=PromptSuggestionResponse)
-async def suggest_prompt_completion(req: PromptSuggestionRequest):
+def suggest_prompt_completion(req: PromptSuggestionRequest):
     """
     Provides AI-generated suggestions to complete or improve a natural language prompt
     for data analysis.
@@ -1562,7 +1688,7 @@ JSON Array of Suggestions:
              )
         )
 
-        response = await model.generate_content_async(
+        response =  model.generate_content(
              suggestion_ai_prompt,
              request_options={'timeout': GEMINI_REQUEST_TIMEOUT // 2} # Use shorter timeout for suggestions
          )
@@ -1631,7 +1757,7 @@ JSON Array of Suggestions:
         503: {"description": "BigQuery service unavailable"}
     }
 )
-async def delete_bigquery_table(
+def delete_bigquery_table(
     dataset_id_only: str = Path(..., description="The ID of the dataset (workspace name only, e.g., 'MVP').", example="MVP"),
     table_id: str = Path(..., description="The ID of the table to delete.", example="Master_Data_Employee_Records_backup"),
     admin_user: dict = Depends(require_admin), # Get admin user data for logging
@@ -1698,7 +1824,7 @@ async def delete_bigquery_table(
         # ... other responses
     }
 )
-async def delete_bigquery_workspace( 
+def delete_bigquery_workspace( 
     dataset_id: str = Path(..., description="The ID of the workspace (dataset name only) to delete.", example="my_team_workspace_to_delete"),
     admin_user: dict = Depends(require_admin), 
     bq_client: bigquery.Client = Depends(get_bigquery_client),
@@ -1725,7 +1851,7 @@ async def delete_bigquery_workspace(
         # This should happen *after* successful BQ deletion.
         # Pass the short dataset_id.
         try:
-            firestore_cleanup_success = await remove_workspace_from_firestore(dataset_id)
+            firestore_cleanup_success =  remove_workspace_from_firestore(dataset_id)
             if firestore_cleanup_success:
                 logger_api.info(f"Admin {admin_uid}: Successfully removed workspace '{dataset_id}' records from Firestore.")
             else:
@@ -1751,10 +1877,132 @@ async def delete_bigquery_workspace(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during workspace deletion: {str(e)}")
     
 
+
+# --- NEW /api/internal/etl-file-completed (called by worker) ---
+@app.post("/api/internal/etl-file-completed", tags=["ETL Internal"], include_in_schema=False)
+def worker_reports_file_completion(payload: WorkerFileCompletionPayload, background_tasks: BackgroundTasks):
+    # Add simple API Key auth for this internal endpoint
+    # api_key = request.headers.get("X-Worker-API-Key")
+    # if api_key != YOUR_WORKER_SECRET_KEY:
+    #     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid worker API key")
+
+    logger_api.info(f"Worker reporting completion: Batch {payload.batch_id}, File {payload.file_id}, Success: {payload.success}")
+    # Use background task for Firestore update to respond to worker quickly
+    background_tasks.add_task(update_file_status_in_firestore, payload)
+    return {"message": "Status received"}
+
+
+# --- Modified /api/etl-batch-status/{batch_id} ---
+@app.get("/api/etl-batch-status/{batch_id}", response_model=Dict[str, Any], tags=["ETL"], dependencies=[Depends(verify_token)])
+def get_etl_batch_status(batch_id: str, current_user: dict = Depends(verify_token)):
+    user_uid = current_user.get("uid")
+    logger_api.debug(f"User {user_uid} polling status for batch_id: {batch_id}")
+    client = get_firestore_client()
+    batch_doc_ref = client.collection(ETL_BATCHES_COLLECTION).document(batch_id)
+    batch_snapshot = batch_doc_ref.get()
+
+    if not batch_snapshot.exists:
+        raise HTTPException(status_code=404, detail="Batch ID not found.")
+
+    batch_data = batch_snapshot.to_dict()
+    # Security check: Ensure the current user owns this batch
+    if batch_data.get("userId") != user_uid:
+        logger_api.warning(f"User {user_uid} attempted to access batch {batch_id} owned by {batch_data.get('userId')}")
+        raise HTTPException(status_code=403, detail="Forbidden: You do not have access to this batch status.")
+
+    return batch_data
+
+# --- NEW /api/user-active-etl-batches ---
+@app.get("/api/user-active-etl-batches", response_model=List[Dict[str, Any]], tags=["ETL"], dependencies=[Depends(verify_token)])
+def get_user_active_etl_batches(current_user: dict = Depends(verify_token)):
+    user_uid = current_user.get("uid")
+    active_batches_data = []
+    try:
+        client = get_firestore_client()
+        query = client.collection(ETL_BATCHES_COLLECTION) \
+            .where(filter=FieldFilter("userId", "==", user_uid)) \
+            .where(filter=FieldFilter("overallBatchStatus", "in", ["processing", "queued_for_trigger", "triggered_to_worker"])) \
+            .order_by("creationTime", direction='DESCENDING') \
+            .limit(10) # Limit to avoid fetching too many old "stuck" batches
+
+        for doc_snapshot in query.stream(): # Use async for loop
+            batch_data = doc_snapshot.to_dict()
+            batch_data["batch_id"] = doc_snapshot.id # Add batch_id to the returned data
+            active_batches_data.append(batch_data)
+
+        logger_api.info(f"Found {len(active_batches_data)} active/pending batches for user {user_uid}")
+        return active_batches_data
+    except Exception as e:
+        logger_api.error(f"Error fetching active ETL batches for user {user_uid}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve active batch statuses.")
+
+
+
+
+
+# If you want to keep feedback related things together, add to feedback_router
+# Otherwise, it can be directly under app or its own router.
+# For this example, let's add it under a general app path or a new utility router.
+
+
+
+
+# Inside main.py
+
+@app.get( 
+    "/api/feedback-image-upload-url",
+    response_model=FeedbackImageUploadUrlResponse,
+    tags=["Feedback Utilities"], 
+    dependencies=[Depends(verify_token)] 
+)
+def get_feedback_image_upload_url(
+    filename: str = Query(..., description="The original name of the image file."), # Get as query param
+    content_type: str = Query(..., description="The MIME type of the image (e.g., image/jpeg)."), # Get as query param
+    current_user: dict = Depends(verify_token),
+    storage_client: storage.Client = Depends(get_storage_client) 
+):
+    user_uid = current_user.get("uid")
+    if not user_uid: # Should be caught by verify_token
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
+
+    if not FEEDBACK_GCS_BUCKET: 
+        logger_api.error("Cannot generate feedback image upload URL: API_GCS_BUCKET not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server storage configuration error.")
+
+    # Sanitize filename received from query parameter
+    clean_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
+    
+    gcs_object_name = f"feedback_attachments/{user_uid}/{uuid.uuid4()}_{clean_filename}"
+
+    try:
+        bucket = storage_client.bucket(FEEDBACK_GCS_BUCKET) 
+        blob = bucket.blob(gcs_object_name)
+
+        upload_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15), 
+            method="PUT",
+            content_type=content_type, # Use content_type from query parameter
+        )
+        
+        logger_api.info(f"Generated signed URL for feedback image: {gcs_object_name} for user {user_uid}")
+        return FeedbackImageUploadUrlResponse(
+            upload_url=upload_url,
+            gcs_object_name=gcs_object_name
+        )
+    except Exception as e:
+        logger_api.error(f"Error generating signed URL for feedback image {filename} for user {user_uid}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate image upload URL.")
+
+
+# main.py
+# ...
+# feedback_router = APIRouter(...) # Assuming you have this defined
+
 @feedback_router.post("/", response_model=FeedbackResponse, status_code=status.HTTP_201_CREATED)
-async def submit_user_feedback(
+def submit_user_feedback(
     feedback_submission: FeedbackSubmission,
-    current_user: Dict[str, Any] = Depends(verify_token) # verify_token ensures user_id
+    current_user: Dict[str, Any] = Depends(verify_token) # verify_token provides user_uid
 ):
     user_uid = current_user.get("uid")
     if not user_uid:
@@ -1762,17 +2010,37 @@ async def submit_user_feedback(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
 
     logger_api.info(f"Received feedback submission from user: {user_uid}, type: {feedback_submission.feedback_type}")
+    
+    # feedback_submission.model_dump(exclude_none=True) will include 'image_urls' if present in the request.
+    # Your store_feedback service needs to be able to handle this list of URLs.
+    feedback_data_to_store = feedback_submission.model_dump(exclude_none=True)
+    
+    logger_api.debug(f"Data being passed to store_feedback: {feedback_data_to_store}")
 
-    feedback_id = await store_feedback(user_uid, feedback_submission.model_dump(exclude_none=True))
+    # Ensure your store_feedback service can handle the 'image_urls' field
+    # and save it appropriately (e.g., as an array in Firestore).
+    feedback_id = store_feedback(user_uid, feedback_data_to_store)
 
     if feedback_id:
         return FeedbackResponse(message="Feedback submitted successfully.", feedback_id=feedback_id)
     else:
+        # This could happen if store_feedback returns None or raises an exception
+        logger_api.error(f"Failed to store feedback for user {user_uid}. store_feedback returned no ID.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not store feedback at this time. Please try again later."
         )
-    
+
+# ...
+
+
+
+# app.include_router(feedback_router) # Make sure router is included
+
+
+
+
+
 
 # --- Include Routers ---
 app.include_router(bq_router)

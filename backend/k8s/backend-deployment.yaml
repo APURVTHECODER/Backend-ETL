@@ -56,6 +56,11 @@ spec:
               configMapKeyRef:
                 name: app-config # The k8s ConfigMap created by the workflow
                 key: gcs.bucket # Key within the ConfigMap
+          - name: FEEDBACK_BUCKET
+            valueFrom:
+              configMapKeyRef:
+                name: app-config # The k8s ConfigMap created by the workflow
+                key: gcs.bucketfeedback # Key within the ConfigMap
           - name: PUBSUB_TOPIC
             valueFrom:
               configMapKeyRef:

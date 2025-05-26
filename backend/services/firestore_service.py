@@ -48,7 +48,7 @@ def initialize_firestore():
     except Exception as e:
         logger_firestore.critical(f"Failed to initialize Firebase Admin SDK with base64 credentials: {e}", exc_info=True)
         db = None
-async def get_user_role(user_uid: str) -> Optional[str]:
+def get_user_role(user_uid: str) -> Optional[str]:
     """
     Fetches the role for a given Firebase User ID from Firestore.
     Assumes a 'users' collection where document ID is the user_uid.
@@ -98,7 +98,7 @@ async def get_user_role(user_uid: str) -> Optional[str]:
         logger_firestore.error(f"Error during Firestore query for UID {user_uid}: {e}", exc_info=True)
         return None # Indicate error fetching role
     
-async def get_user_accessible_datasets(user_uid: str) -> Optional[List[str]]:
+def get_user_accessible_datasets(user_uid: str) -> Optional[List[str]]:
     """
     Fetches the list of dataset IDs a specific user can access from Firestore.
     Returns a list of dataset IDs, an empty list, or None on error/not found.
@@ -136,7 +136,7 @@ async def get_user_accessible_datasets(user_uid: str) -> Optional[List[str]]:
     
 
 
-async def set_user_access(user_uid: str, role: str, dataset_ids: Optional[List[str]]) -> bool:
+def set_user_access(user_uid: str, role: str, dataset_ids: Optional[List[str]]) -> bool:
     """
     Sets or updates the role and accessible datasets for a user in Firestore.
     Creates the user document if it doesn't exist. Uses merge=True.
@@ -186,7 +186,7 @@ async def set_user_access(user_uid: str, role: str, dataset_ids: Optional[List[s
 logger_firestore = logging.getLogger(__name__ + "_firestore") # Ensure logger is defined
 
 
-async def get_uid_from_email(email: str) -> Optional[str]:
+def get_uid_from_email(email: str) -> Optional[str]:
     """
     Finds the Firebase UID associated with an email address.
 
@@ -217,7 +217,7 @@ async def get_uid_from_email(email: str) -> Optional[str]:
         )
         return None
     
-async def register_workspace_and_grant_access(
+def register_workspace_and_grant_access(
     dataset_id: str,
     owner_uid: str,
     location: str,
@@ -281,7 +281,7 @@ async def register_workspace_and_grant_access(
         return False
 
 
-async def remove_workspace_from_firestore(dataset_id: str) -> bool:
+def remove_workspace_from_firestore(dataset_id: str) -> bool:
     """
     Removes a workspace from Firestore:
     1. Deletes the workspace's metadata document (e.g., from 'workspaces/{dataset_id}').
@@ -338,7 +338,7 @@ async def remove_workspace_from_firestore(dataset_id: str) -> bool:
 # services/firestore_service.py
 # ... (existing imports and code) ...
 
-async def ensure_user_document_exists(user_uid: str, email: Optional[str] = None, display_name: Optional[str] = None) -> bool:
+def ensure_user_document_exists(user_uid: str, email: Optional[str] = None, display_name: Optional[str] = None) -> bool:
     """
     Checks if a user document exists in Firestore for the given UID.
     If not, it creates a new document with default values.
@@ -407,4 +407,6 @@ def get_firestore_client() -> Optional[firestore.Client]:
     if db is None:
         logger_firestore.error("Firestore client requested before initialization or initialization failed.")
     return db
+
+initialize_firestore()
 # ... (rest of your firestore_service.py code) ...
