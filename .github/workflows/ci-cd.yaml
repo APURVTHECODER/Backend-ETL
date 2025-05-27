@@ -178,8 +178,8 @@ jobs:
 
           # Add Plain text secrets
           literal_args+=" --from-literal=gemini.api.key=$SECRET_GEMINI_API_KEY"
-          literal_args+=" --from-literal=gemini.api.key=$SECRET_GEMINI_API_KEY2"
-          literal_args+=" --from-literal=gemini.api.key=$SECRET_GEMINI_API_KEY3"
+          literal_args+=" --from-literal=gemini.api.key2=$SECRET_GEMINI_API_KEY2"
+          literal_args+=" --from-literal=gemini.api.key3=$SECRET_GEMINI_API_KEY3"
           literal_args+=" --from-literal=allowed.origins=$SECRET_ALLOWED_ORIGINS"
           literal_args+=" --from-literal=pubsub.subscription=$SECRET_PUBSUB_SUBSCRIPTION"
           literal_args+=" --from-literal=worker.gemini.timeout=$SECRET_WORKER_GEMINI_TIMEOUT"
