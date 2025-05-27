@@ -585,7 +585,7 @@ Generated BigQuery SQL Query:
         # 5. Call Gemini API (Unchanged)
 # 5. Call Gemini API via helper
         response = generate_with_key(
-            0,  # Use ENV GEMINI_API_KEY (first key)
+            1,  # Use ENV GEMINI_API_KEY (first key)
             prompt_template,
             GEMINI_REQUEST_TIMEOUT
         )
@@ -1073,7 +1073,7 @@ Summary of Findings:
 
         # --- Call Gemini API ---
         response = generate_with_key(
-            1,  # use ENV GEMINI_API_KEY2 (second key)
+            2,  # use ENV GEMINI_API_KEY2 (second key)
             summary_prompt,
             GEMINI_REQUEST_TIMEOUT
         )
@@ -1652,7 +1652,7 @@ JSON Array of Suggestions:
         # --- Call Gemini API ---
         # Using a model optimized for fast responses is good here
         response = generate_with_key(
-            0,  # use ENV GEMINI_API_KEY (first key)
+            2,  # use ENV GEMINI_API_KEY (first key)
             suggestion_ai_prompt,
             GEMINI_REQUEST_TIMEOUT // 2
         )
