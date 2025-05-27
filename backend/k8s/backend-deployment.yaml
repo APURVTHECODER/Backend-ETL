@@ -42,6 +42,16 @@ spec:
               secretKeyRef:
                 name: app-secrets # Same k8s secret
                 key: gemini.api.key # Key holding the plain API key
+          - name: GEMINI_API_KEY2
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # Same k8s secret
+                key: gemini.api.key2 # Key holding the plain API key
+          - name: GEMINI_API_KEY3
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets # Same k8s secret
+                key: gemini.api.key3 # Key holding the plain API key
 
           # Example: Add Database URL if needed and created in workflow
           # - name: DATABASE_URL
