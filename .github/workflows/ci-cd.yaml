@@ -149,6 +149,8 @@ jobs:
           SECRET_GAC_B64: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
           # Plain Text Secrets
           SECRET_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SECRET_GEMINI_API_KEY2: ${{ secrets.GEMINI_API_KEY2 }}
+          SECRET_GEMINI_API_KEY3: ${{ secrets.GEMINI_API_KEY3 }}
           SECRET_ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
           SECRET_PUBSUB_SUBSCRIPTION: ${{ secrets.PUBSUB_SUBSCRIPTION }}
           SECRET_WORKER_GEMINI_TIMEOUT: ${{ secrets.WORKER_GEMINI_TIMEOUT }}
@@ -160,6 +162,8 @@ jobs:
           if [ -z "$SECRET_FIREBASE_B64" ]; then echo "Error: FIREBASE_ADMIN_SDK_KEY_BASE64 secret is empty!"; exit 1; fi
           # Add checks for other critical secrets if necessary
           if [ -z "$SECRET_GEMINI_API_KEY" ]; then echo "Warning: GEMINI_API_KEY secret is empty!"; fi
+          if [ -z "$SECRET_GEMINI_API_KEY2" ]; then echo "Warning: GEMINI_API_KEY2 secret is empty!"; fi
+          if [ -z "$SECRET_GEMINI_API_KEY3" ]; then echo "Warning: GEMINI_API_KEY3 secret is empty!"; fi
           # ... add other warnings if needed ...
 
           # --- Build the --from-literal arguments ---
@@ -174,6 +178,8 @@ jobs:
 
           # Add Plain text secrets
           literal_args+=" --from-literal=gemini.api.key=$SECRET_GEMINI_API_KEY"
+          literal_args+=" --from-literal=gemini.api.key2=$SECRET_GEMINI_API_KEY2"
+          literal_args+=" --from-literal=gemini.api.key3=$SECRET_GEMINI_API_KEY3"
           literal_args+=" --from-literal=allowed.origins=$SECRET_ALLOWED_ORIGINS"
           literal_args+=" --from-literal=pubsub.subscription=$SECRET_PUBSUB_SUBSCRIPTION"
           literal_args+=" --from-literal=worker.gemini.timeout=$SECRET_WORKER_GEMINI_TIMEOUT"

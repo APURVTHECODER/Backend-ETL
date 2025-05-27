@@ -10,7 +10,9 @@ import logging
 import os # os might not be needed anymore if not checking path
 from typing import Optional
 import asyncio # For potential concurrency later
-
+from dotenv import load_dotenv
+# --- Load Environment Variables ---
+load_dotenv()
 
 logger_firestore = logging.getLogger(__name__ + "_firestore")
 db: Optional[firestore.Client] = None # Initialize db as None, optionally type hint

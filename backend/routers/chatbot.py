@@ -15,13 +15,13 @@ logger_chatbot = logging.getLogger(__name__ + "_chatbot")
 logger_chatbot.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 # --- Configuration (Ensure Gemini API Key is loaded in main.py) ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY2 = os.getenv("GEMINI_API_KEY2")
 GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash-latest") # Using gemini-pro for general chat
 GEMINI_CHAT_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT_SECONDS", 120))
 
 # Check if Gemini was configured successfully in main.py
-if not GEMINI_API_KEY:
-    logger_chatbot.warning("Chatbot Router: GEMINI_API_KEY not set. Chat endpoint will fail.")
+if not GEMINI_API_KEY2:
+    logger_chatbot.warning("Chatbot Router: GEMINI_API_KEY2 not set. Chat endpoint will fail.")
     # No need to configure again if main.py did it.
     # If you want this router to be self-contained, you could add configuration here,
     # but it's better to rely on the central config in main.py.
@@ -44,7 +44,7 @@ class ChatResponse(BaseModel):
 @chat_router.post("/chat", response_model=ChatResponse)
 def handle_chat_prompt(req: ChatRequest):
     """Receives a user prompt and returns a response from the Gemini model."""
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY2:
         logger_chatbot.error("Chatbot request failed: Gemini API key not configured.")
         raise HTTPException(status_code=503, detail="Chatbot service is not configured.")
 
