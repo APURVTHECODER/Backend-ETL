@@ -1663,7 +1663,7 @@ JSON Array of Suggestions:
         error_msg = None
         try:
             # Clean potential markdown ```json ... ``` artifacts
-            cleaned_response = response.text.strip()
+            cleaned_response = response.strip()
             if cleaned_response.startswith("```json"):
                 cleaned_response = cleaned_response[len("```json"):].strip()
             if cleaned_response.endswith("```"):

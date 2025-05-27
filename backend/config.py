@@ -77,7 +77,6 @@ for key_name, key in [
         try:
             genai.configure(api_key=key)
             logger_config.info(f"Gemini API configured successfully using {key_name}.")
-            break
         except Exception as e:
             logger_config.error(
                 f"Failed to configure Gemini API with {key_name}: {e}",
