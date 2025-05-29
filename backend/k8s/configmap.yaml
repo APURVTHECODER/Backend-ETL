@@ -5,6 +5,8 @@ metadata:
 data:
   log.level: "INFO"
   gcs.bucket: "mybucket78600"      # ← your real GCS bucket
+  gcs.bucketfeedback: "feedbackonly"
   pubsub.topic: "mytopic78600"                    # ← your real Pub/Sub topic
   bq.dataset: "sample78600"
   pubsub.subscription: "etl-worker-sub"
+  VITE_API_BASE_URL: "http://backend-service.default.svc.cluster.local:80"

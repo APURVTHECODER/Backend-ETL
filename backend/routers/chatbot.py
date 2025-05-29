@@ -42,7 +42,7 @@ class ChatResponse(BaseModel):
 
 # --- Chatbot Endpoint ---
 @chat_router.post("/chat", response_model=ChatResponse)
-async def handle_chat_prompt(req: ChatRequest):
+def handle_chat_prompt(req: ChatRequest):
     """Receives a user prompt and returns a response from the Gemini model."""
     if not GEMINI_API_KEY:
         logger_chatbot.error("Chatbot request failed: Gemini API key not configured.")
@@ -58,7 +58,7 @@ async def handle_chat_prompt(req: ChatRequest):
         # e.g., "You are a helpful assistant." + req.prompt
         full_prompt = req.prompt # Keep it simple for now
 
-        response = await model.generate_content_async(
+        response = model.generate_content(
             full_prompt,
             generation_config=genai.types.GenerationConfig(
                 # Adjust temperature/top_p as needed for creativity vs factualness

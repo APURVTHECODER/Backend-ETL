@@ -198,6 +198,7 @@ jobs:
         env:
           # Map GitHub Secrets to temporary env vars for the script
           CONFIG_GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET }}
+          CONFIG_FEEDBACK_BUCKET: ${{ secrets.FEEDBACK_BUCKET }}
           CONFIG_PUBSUB_TOPIC_NAME: ${{ secrets.PUBSUB_TOPIC }}
           # CONFIG_ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }} # Example
         run: |
@@ -210,6 +211,7 @@ jobs:
           data:
             log.level: "INFO" # Example static value
             gcs.bucket: "$CONFIG_GCS_BUCKET_NAME"
+            gcs.bucketfeedback: "$CONFIG_FEEDBACK_BUCKET"
             pubsub.topic: "$CONFIG_PUBSUB_TOPIC_NAME"
             # allowed.origins: "$CONFIG_ALLOWED_ORIGINS" # Example
             # Add other non-sensitive config key-value pairs here

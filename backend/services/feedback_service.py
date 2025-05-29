@@ -11,7 +11,7 @@ from .firestore_service import db, logger_firestore # Adjust import path if need
 
 logger_feedback = logging.getLogger(__name__ + "_feedback")
 
-async def store_feedback(
+def store_feedback(
     user_uid: str,
     feedback_data: Dict[str, Any]
 ) -> Optional[str]:

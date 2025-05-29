@@ -60,7 +60,7 @@ class ManageAccessResponse(BaseModel):
 
 # --- Existing Endpoint (No Changes) ---
 @user_profile_router.get("/me/profile", response_model=UserProfileResponse)
-async def get_my_profile(user: dict = Depends(verify_token)):
+def get_my_profile(user: dict = Depends(verify_token)):
     """
     Retrieves the profile information (including role) for the currently authenticated user.
     """
@@ -71,7 +71,7 @@ async def get_my_profile(user: dict = Depends(verify_token)):
              status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
              detail="Could not identify user.",
         )
-    role_from_db = await get_user_role(user_uid)
+    role_from_db = get_user_role(user_uid)
     effective_role = role_from_db if role_from_db else 'user'
     logger_profile.info(f"Returning profile for UID {user_uid} with effective role: {effective_role}")
     return UserProfileResponse(
@@ -87,7 +87,7 @@ async def get_my_profile(user: dict = Depends(verify_token)):
     summary="Manage User Roles and Dataset Access (Admin Only)",
     status_code=status.HTTP_200_OK # Return 200 even for partial success
 )
-async def manage_user_access(
+def manage_user_access(
     request: ManageAccessRequest,
     admin_user: dict = Depends(require_admin) # Get admin user data for logging
 ):
@@ -106,13 +106,13 @@ async def manage_user_access(
     failed_details: List[Dict[str, str]] = []
 
     # Process emails concurrently
-    async def process_email(email: str):
+    def process_email(email: str):
         nonlocal success_updates # Allow modification of outer scope variable
-        uid = await get_uid_from_email(email)
+        uid = get_uid_from_email(email)
         if uid:
             # Pass dataset_ids only if role is 'user'
             datasets = request.dataset_ids if request.role == 'user' else None
-            success = await set_user_access(uid, request.role, datasets)
+            success = set_user_access(uid, request.role, datasets)
             if success:
                  # Only increment if Firestore update was successful
                  success_updates += 1
@@ -126,7 +126,7 @@ async def manage_user_access(
 
     # Run tasks concurrently using asyncio.gather
     tasks = [process_email(email) for email in request.emails]
-    results = await asyncio.gather(*tasks)
+    results = asyncio.gather(*tasks)
 
     # Collect failures from results (None indicates success)
     for result in results:
