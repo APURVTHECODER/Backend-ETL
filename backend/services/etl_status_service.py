@@ -64,7 +64,8 @@ def initialize_batch_status_in_firestore(
             "lastUpdated": datetime.now(timezone.utc).isoformat(),
             "errorMessage": None,
             "is_multi_header": file_detail.get("is_multi_header", False),
-            "header_depth": file_detail.get("header_depth") 
+            "header_depth": file_detail.get("header_depth") ,
+            "apply_ai_smart_cleanup": file_detail.get("apply_ai_smart_cleanup", False),
         }
 
     initial_batch_data = {

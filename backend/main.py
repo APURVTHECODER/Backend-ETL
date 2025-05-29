@@ -103,7 +103,7 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     original_file_name: str = Field(..., description="The original name of the file uploaded by the user")
     is_multi_header: Optional[bool] = Field(default=False)
     header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
-
+    apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
 
 class FeedbackImageUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="The original name of the image file.")
@@ -126,6 +126,7 @@ class ETLRequestPubSubPayload(BaseModel):
     batch_id: str             # UUID for the batch this file belongs to
     file_id: str              # UUID for this specific file processing task
     original_file_name: str
+    apply_ai_smart_cleanup: Optional[bool] = False # NEW
 
 # Payload from ETL Worker to report file completion status
 class WorkerFileCompletionPayload(BaseModel):
@@ -188,6 +189,7 @@ class ETLRequest(BaseModel):
         # +++ NEW FIELDS FOR MULTI-HEADER +++
     is_multi_header: Optional[bool] = Field(default=False, description="Indicates if the file has multi-level headers.")
     header_depth: Optional[conint(ge=1, le=10)] = Field(None, description="Number of rows making up the header, if multi-header. Min 1, Max 10.")
+    apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
 # +++ MODIFICATION END +++
 class ColumnInfo(BaseModel): name: str; type: str; mode: str
 class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
@@ -585,7 +587,7 @@ Generated BigQuery SQL Query:
         # 5. Call Gemini API (Unchanged)
 # 5. Call Gemini API via helper
         response = generate_with_key(
-            0,  # Use ENV GEMINI_API_KEY (first key)
+            1,  # Use ENV GEMINI_API_KEY (first key)
             prompt_template,
             GEMINI_REQUEST_TIMEOUT
         )
@@ -866,7 +868,8 @@ def trigger_etl(
         "original_file_name": payload.original_file_name,
         "gcs_object_name": payload.object_name,
         "is_multi_header": payload.is_multi_header,
-        "header_depth": payload.header_depth
+        "header_depth": payload.header_depth,
+        "apply_ai_smart_cleanup": payload.apply_ai_smart_cleanup,
     }
 
     batch_init_response = initialize_batch_status_in_firestore(user_uid, [file_detail_for_batch_init])
@@ -896,10 +899,12 @@ def trigger_etl(
         header_depth=payload.header_depth,
         batch_id=batch_id,
         file_id=file_id,
-        original_file_name=payload.original_file_name
+        original_file_name=payload.original_file_name,
+        apply_ai_smart_cleanup=payload.apply_ai_smart_cleanup
     )
     message_data_dict = pubsub_message_payload.model_dump()
     data_bytes = json.dumps(message_data_dict).encode("utf-8")
+    logger_api.info(f"Attempting to publish to Pub/Sub. Full payload being serialized: {message_data_dict}")
     try:
         future = publisher.publish(topic_path, data=data_bytes)
         logger_api.debug(f"Pub/Sub message publish initiated for batch {batch_id}, file {file_id}.")
@@ -1073,7 +1078,7 @@ Summary of Findings:
 
         # --- Call Gemini API ---
         response = generate_with_key(
-            1,  # use ENV GEMINI_API_KEY2 (second key)
+            2,  # use ENV GEMINI_API_KEY2 (second key)
             summary_prompt,
             GEMINI_REQUEST_TIMEOUT
         )
@@ -1652,7 +1657,7 @@ JSON Array of Suggestions:
         # --- Call Gemini API ---
         # Using a model optimized for fast responses is good here
         response = generate_with_key(
-            0,  # use ENV GEMINI_API_KEY (first key)
+            2,  # use ENV GEMINI_API_KEY (first key)
             suggestion_ai_prompt,
             GEMINI_REQUEST_TIMEOUT // 2
         )
@@ -1663,7 +1668,7 @@ JSON Array of Suggestions:
         error_msg = None
         try:
             # Clean potential markdown ```json ... ``` artifacts
-            cleaned_response = response.text.strip()
+            cleaned_response = response.strip()
             if cleaned_response.startswith("```json"):
                 cleaned_response = cleaned_response[len("```json"):].strip()
             if cleaned_response.endswith("```"):
