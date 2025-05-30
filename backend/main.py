@@ -49,7 +49,7 @@ from dependencies.client_deps import (
     get_pubsub_publisher,
     get_pubsub_topic_path
 )
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, Field, conint, validator
 from services.etl_status_service import WorkerFileCompletionPayload
 # Utilities
 import pandas as pd
@@ -104,6 +104,13 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     is_multi_header: Optional[bool] = Field(default=False)
     header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
     apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
+    text_normalization_mode: Optional[str] = Field(None, description="Selected AI text normalization mode if smart cleanup is enabled.")
+
+    @validator('text_normalization_mode', pre=True, always=True)
+    def set_text_normalization_mode_if_cleanup_disabled(cls, v, values):
+        if 'apply_ai_smart_cleanup' in values and not values['apply_ai_smart_cleanup']:
+            return None # Ensure mode is None if cleanup is off
+        return v
 
 class FeedbackImageUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="The original name of the image file.")
@@ -127,6 +134,7 @@ class ETLRequestPubSubPayload(BaseModel):
     file_id: str              # UUID for this specific file processing task
     original_file_name: str
     apply_ai_smart_cleanup: Optional[bool] = False # NEW
+    text_normalization_mode: Optional[str] = None 
 
 # Payload from ETL Worker to report file completion status
 class WorkerFileCompletionPayload(BaseModel):
@@ -870,6 +878,7 @@ def trigger_etl(
         "is_multi_header": payload.is_multi_header,
         "header_depth": payload.header_depth,
         "apply_ai_smart_cleanup": payload.apply_ai_smart_cleanup,
+        "text_normalization_mode":payload.text_normalization_mode 
     }
 
     batch_init_response = initialize_batch_status_in_firestore(user_uid, [file_detail_for_batch_init])
@@ -900,7 +909,8 @@ def trigger_etl(
         batch_id=batch_id,
         file_id=file_id,
         original_file_name=payload.original_file_name,
-        apply_ai_smart_cleanup=payload.apply_ai_smart_cleanup
+        apply_ai_smart_cleanup=payload.apply_ai_smart_cleanup,
+        text_normalization_mode=payload.text_normalization_mode 
     )
     message_data_dict = pubsub_message_payload.model_dump()
     data_bytes = json.dumps(message_data_dict).encode("utf-8")
