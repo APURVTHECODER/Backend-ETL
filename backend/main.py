@@ -31,7 +31,7 @@ from services.etl_status_service import (
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
 from google.cloud.exceptions import NotFound, BadRequest , Conflict
-from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded
+from google.api_core.exceptions import GoogleAPICallError, DeadlineExceeded, Forbidden
 from google.oauth2 import service_account
 import google.generativeai as genai
 from routers.export import export_router
@@ -153,6 +153,18 @@ class FeedbackImageUploadUrlResponse(BaseModel):
     gcs_object_name: str # The full path in GCS where the file will be stored
     # You could also return a public_url if your bucket/objects are public and you construct it
 
+class BulkDeleteRequest(BaseModel):
+    table_ids: List[str] = Field(..., min_items=1, description="A list of table IDs to delete.")
+
+class BulkDeleteResponseDetail(BaseModel):
+    table_id: str
+    status: str # "deleted", "error", "not_found", "forbidden"
+    message: Optional[str] = None
+
+class BulkDeleteSummaryResponse(BaseModel):
+    dataset_id: str
+    results: List[BulkDeleteResponseDetail]
+    overall_status: str # e.g., "all_successful", "partial_success", "all_failed"
 
 # Payload for the Pub/Sub message (sent to the ETL worker)
 class ETLRequestPubSubPayload(BaseModel):
@@ -1788,6 +1800,81 @@ def delete_bigquery_table(
         logger_api.error(f"Admin {admin_uid}: Unexpected error deleting table '{full_table_id}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during table deletion: {str(e)}")
 # ... (rest of the existing endpoints like /schema, /nl2sql, /jobs, etc.) ...
+
+
+@bq_router.post( # Using POST because DELETE with a complex body can be tricky/non-standard
+    "/datasets/{dataset_id_only}/tables-bulk-delete",
+    response_model=BulkDeleteSummaryResponse, # Or a simpler success/failure message
+    tags=["BigQuery Tables"],
+    summary="Bulk Delete Multiple BigQuery Tables",
+    description="Permanently deletes multiple specified tables within a workspace. RBAC is applied."
+)
+async def bulk_delete_bigquery_tables( # Changed to async to allow concurrent BQ calls if desired, though not strictly necessary for sequential delete
+    payload: BulkDeleteRequest,
+    dataset_id_only: str = Path(..., description="The ID of the workspace (dataset name only)."),
+    user: dict = Depends(verify_token),
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
+):
+    user_uid = user.get("uid")
+    if not user_uid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication error.")
+
+    if not API_GCP_PROJECT: # Ensure API_GCP_PROJECT is accessible
+        logger_api.error(f"User {user_uid}: Cannot bulk delete tables in dataset '{dataset_id_only}': API_GCP_PROJECT not configured.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error.")
+
+    logger_api.info(f"User '{user_uid}' attempting to bulk delete tables {payload.table_ids} from workspace '{dataset_id_only}'.")
+
+    # RBAC Check (similar to single delete, but applied to the dataset level first)
+    user_role = get_user_role(user_uid) # Assuming get_user_role is defined
+    can_access_dataset = False
+    if user_role == 'admin':
+        can_access_dataset = True
+    else:
+        accessible_datasets = get_user_accessible_datasets(user_uid) # Assuming this is defined
+        if accessible_datasets is None:
+             logger_api.error(f"User '{user_uid}': Could not verify access to workspace '{dataset_id_only}' for bulk table deletion due to Firestore error.")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify workspace access.")
+        if dataset_id_only in accessible_datasets:
+            can_access_dataset = True
+    
+    if not can_access_dataset:
+        logger_api.warning(f"User '{user_uid}' (Role: {user_role}) does not have access to workspace '{dataset_id_only}'. Bulk deletion denied.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"You do not have permission to delete tables in workspace '{dataset_id_only}'.")
+
+    results: List[BulkDeleteResponseDetail] = []
+    successful_deletes_count = 0
+
+    for table_id in payload.table_ids:
+        full_table_id = f"{API_GCP_PROJECT}.{dataset_id_only}.{table_id}"
+        try:
+            logger_api.warning(f"User '{user_uid}' (Role: {user_role}) is proceeding to DELETE table (bulk): {full_table_id}")
+            bq_client.delete_table(full_table_id, not_found_ok=False) # Set not_found_ok=False to catch if it's already gone
+            results.append(BulkDeleteResponseDetail(table_id=table_id, status="deleted", message="Successfully deleted."))
+            successful_deletes_count += 1
+        except NotFound:
+            logger_api.warning(f"User '{user_uid}': Table not found during bulk delete attempt: {full_table_id}")
+            results.append(BulkDeleteResponseDetail(table_id=table_id, status="not_found", message="Table not found."))
+        except Forbidden as fe:
+            logger_api.error(f"User '{user_uid}': Forbidden error deleting table '{full_table_id}' (bulk): {fe}", exc_info=True)
+            results.append(BulkDeleteResponseDetail(table_id=table_id, status="forbidden", message=f"Permission error: {str(fe)}"))
+        except GoogleAPICallError as e:
+            logger_api.error(f"User '{user_uid}': Google API Error deleting table '{full_table_id}' (bulk): {e}", exc_info=True)
+            results.append(BulkDeleteResponseDetail(table_id=table_id, status="error", message=f"API error: {str(e)}"))
+        except Exception as e:
+            logger_api.error(f"User '{user_uid}': Unexpected error deleting table '{full_table_id}' (bulk): {e}", exc_info=True)
+            results.append(BulkDeleteResponseDetail(table_id=table_id, status="error", message=f"Unexpected server error: {str(e)}"))
+    
+    overall_status = "all_failed"
+    if successful_deletes_count == len(payload.table_ids):
+        overall_status = "all_successful"
+    elif successful_deletes_count > 0:
+        overall_status = "partial_success"
+    
+    logger_api.info(f"Bulk delete for dataset '{dataset_id_only}' completed by user '{user_uid}'. Status: {overall_status}, Results: {results}")
+    return BulkDeleteSummaryResponse(dataset_id=dataset_id_only, results=results, overall_status=overall_status)
+
+
 
 
 @bq_router.delete(
