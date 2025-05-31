@@ -1,11 +1,13 @@
 # backend/routers/export.py
 
+import json
 import os
 import logging
 import re
 import io
 import traceback # Ensure traceback is imported for detailed error logging
 from typing import List, Dict, Any, Optional, Set
+import uuid
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Response, status # Import status
@@ -23,7 +25,7 @@ from openpyxl.styles import Font
 # --- Import Config Variables ---
 # Import only specific variables needed from config
 from config import DEFAULT_BQ_LOCATION, DEFAULT_JOB_TIMEOUT_SECONDS
-
+from dateutil.parser import parse as dateutil_parse 
 # --- Import Dependencies ---
 from auth import verify_token # For authentication
 from dependencies.client_deps import get_bigquery_client # Import client dependency getter
@@ -55,6 +57,8 @@ class QueryToExcelRequest(BaseModel):
     chart_image_base64: Optional[str] = Field(None) # No '...' default for Optional
     chart_config: Optional[ChartConfig] = Field(None)
     chart_data: Optional[List[Dict[str, Any]]] = Field(None)
+    data_override: Optional[List[Dict[str, Any]]] = Field(None, description="If provided, use this data instead of re-fetching full results.")
+    schema_override: Optional[List[Dict[str, Any]]] = Field(None, description="Schema for the data_override. Each dict: {'name': str, 'type': str}")
 # --- Pydantic Models ---
 class QueryExportRequest(BaseModel):
     sql: str = Field(..., description="The SQL query that was executed.")
@@ -181,229 +185,193 @@ def make_datetime_naive(df: pd.DataFrame) -> pd.DataFrame:
                         },
                         # ... other responses
                     })
-def export_query_to_excel( # Renamed to match your previous working one
-    payload: QueryToExcelRequest, # Use the Pydantic model that includes chart fields
+
+
+
+
+@export_router.post("/query-to-excel",
+                    response_class=Response,
+                    summary="Export Query Results, SQL, Source Previews, and Optional Chart to Excel",
+                    # ... other decorator arguments
+                   )
+def export_query_to_excel(
+    payload: QueryToExcelRequest,
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ):
-    logger_export.info(f"Received Excel export request for Job ID: {payload.job_id}. Chart included: {'Yes' if payload.chart_image_base64 else 'No'}")
+    logger_export.info(f"Received Excel export request for Job ID: {payload.job_id}. Data override provided: {'Yes' if payload.data_override is not None else 'No'}. Chart included: {'Yes' if payload.chart_image_base64 else 'No'}")
 
     if not bq_client:
          logger_export.error("Export Endpoint: BigQuery client is None via dependency.")
          raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BigQuery client dependency failed.")
 
     try:
-        # 1. Fetch Job Results
-        logger_export.info(f"Fetching results for job {payload.job_id} in location {payload.location}...")
-        try:
-            job = bq_client.get_job(payload.job_id, location=payload.location)
-        except NotFound:
-             logger_export.warning(f"Job ID {payload.job_id} not found in location {payload.location}.")
-             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job ID '{payload.job_id}' not found.")
-
-        if job.state != 'DONE':
-            logger_export.warning(f"Job {payload.job_id} is not complete (State: {job.state}). Cannot export.")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} not complete.")
-        if job.error_result:
-            err_msg = job.error_result.get('message', 'Unknown error')
-            logger_export.warning(f"Job {payload.job_id} failed: {err_msg}. Cannot export.")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} failed.")
-
-        results_df: pd.DataFrame
-        result_rows_data_for_excel: List[List[Any]] = [] # For openpyxl direct write
-        result_schema_for_excel: List[str] = []
-
-
-        if not job.destination:
-            logger_export.info(f"Job {payload.job_id} had no destination (e.g., DML). Creating info df.")
-            # For consistency, we'll still aim to use openpyxl directly later
-            result_schema_for_excel = ["Information"]
-            result_rows_data_for_excel.append([f"Query (Job ID: {job.job_id}) did not produce a standard result table."])
-            if job.statement_type:
-                result_rows_data_for_excel.append([f"Statement Type: {job.statement_type}"])
-            if hasattr(job, 'num_dml_affected_rows') and job.num_dml_affected_rows is not None:
-                result_rows_data_for_excel.append([f"Rows Affected: {job.num_dml_affected_rows}"])
-        else:
-            logger_export.info(f"Fetching ALL rows from destination table for job {payload.job_id}...")
-            rows_iterator = bq_client.list_rows(job.destination, timeout=300) # Timeout for list_rows
-            
-            if rows_iterator.schema:
-                result_schema_for_excel = [field.name for field in rows_iterator.schema]
-            
-            for row_data in rows_iterator:
-                serialized_values = []
-                for field_name in result_schema_for_excel: # Iterate based on schema order
-                    value = row_data[field_name]
-                    if isinstance(value, bytes):
-                        try: serialized_values.append(value.decode('utf-8'))
-                        except UnicodeDecodeError: serialized_values.append(f"0x{value.hex()}")
-                    elif isinstance(value, (datetime, pd.Timestamp)):
-                        # Excel handles datetimes best if they are naive or UTC Python datetimes
-                        if value.tzinfo is not None:
-                            value = value.astimezone(timezone.utc).replace(tzinfo=None) # Convert to naive UTC
-                        serialized_values.append(value) # Pass Python datetime object
-                    elif isinstance(value, date):
-                        serialized_values.append(value) # Pass Python date object
-                    elif isinstance(value, time):
-                         # openpyxl might not handle time objects well directly without date.
-                         # Convert to string or datetime with dummy date.
-                        serialized_values.append(value.isoformat())
-                    elif isinstance(value, list) or isinstance(value, dict):
-                        serialized_values.append(json.dumps(value, default=str))
-                    else:
-                        serialized_values.append(value)
-                result_rows_data_for_excel.append(serialized_values)
-            logger_export.info(f"Fetched {len(result_rows_data_for_excel)} result rows for job {payload.job_id}.")
-
-        # Create Workbook
         workbook = Workbook()
-        
-        # --- Sheet 1: Main Query Results ---
         results_sheet = workbook.active
         results_sheet.title = "Query Results"
-        if result_schema_for_excel:
-            results_sheet.append(result_schema_for_excel) # Add headers
-        for row_values in result_rows_data_for_excel:
-            results_sheet.append(row_values) # Add data rows
-        logger_export.info(f"Main query results written to Excel sheet 'Query Results'.")
 
-        # --- Sheet 2: Original SQL Query ---
-        # query_sheet = workbook.create_sheet(title="SQL Query")
-        # query_sheet.cell(row=1, column=1, value="Executed SQL Query:")
-        # query_sheet.cell(row=2, column=1, value=payload.sql)
-        # # Optional: Auto-adjust column width for SQL
-        # query_sheet.column_dimensions['A'].width = 80 
-        # logger_export.info("SQL query written to Excel sheet 'SQL Query'.")
+        result_rows_for_excel: List[List[Any]] = []
+        result_schema_names_for_excel: List[str] = []
 
-        # --- Sheets 3+: Source Table Previews ---
+        # --- +++ LOGIC TO USE DATA_OVERRIDE OR FALLBACK +++ ---
+        if payload.data_override is not None:
+            if len(payload.data_override) > 0:
+                logger_export.info(f"Using data_override for 'Query Results' sheet. Rows: {len(payload.data_override)}")
+                
+                # Determine schema: use schema_override if provided, else infer from data_override keys
+                if payload.schema_override and len(payload.schema_override) > 0:
+                    result_schema_names_for_excel = [field.get("name", f"UnknownCol_{i}") for i, field in enumerate(payload.schema_override)]
+                    logger_export.info(f"Using schema_override for headers: {result_schema_names_for_excel}")
+                else: # Infer schema from first row of data_override
+                    result_schema_names_for_excel = list(payload.data_override[0].keys())
+                    logger_export.info(f"Inferred schema from data_override keys: {result_schema_names_for_excel}")
+                
+                # Convert list of dicts (data_override) to list of lists for openpyxl
+                for row_dict in payload.data_override:
+                    row_values = []
+                    for col_name in result_schema_names_for_excel:
+                        value = row_dict.get(col_name)
+                        # Apply serialization for consistency
+                        if isinstance(value, str) and re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', value):
+                            try:
+                                # Parse ISO string from frontend back into a datetime object
+                                dt_obj = dateutil_parse(value)
+                                if dt_obj.tzinfo is not None:
+                                    dt_obj = dt_obj.astimezone(timezone.utc).replace(tzinfo=None)
+                                value = dt_obj
+                            except (ValueError, TypeError):
+                                pass # Keep as string if parsing fails
+                        elif isinstance(value, list) or isinstance(value, dict):
+                            value = json.dumps(value, default=str)
+                        row_values.append(value)
+                    result_rows_for_excel.append(row_values)
+            else: # data_override is an empty list
+                logger_export.info("data_override was provided but is empty. Creating an empty 'Query Results' sheet with headers if possible.")
+                if payload.schema_override and len(payload.schema_override) > 0:
+                    result_schema_names_for_excel = [field.get("name", f"UnknownCol_{i}") for i, field in enumerate(payload.schema_override)]
+                else: # No schema and no data, create a placeholder
+                    result_schema_names_for_excel = ["Information"]
+                    result_rows_for_excel.append(["Filtered data set was empty."])
+
+        else: # Fallback to fetching full results from BigQuery if no data_override
+            logger_export.info(f"No data_override. Fetching full results for job {payload.job_id} from BigQuery.")
+            try:
+                job = bq_client.get_job(payload.job_id, location=payload.location)
+            except NotFound:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job ID '{payload.job_id}' not found.")
+
+            if job.state != 'DONE': raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} not complete.")
+            if job.error_result: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {payload.job_id} failed: {job.error_result.get('message', 'Unknown')}")
+
+            if not job.destination:
+                result_schema_names_for_excel = ["Information"]
+                result_rows_for_excel.append([f"Query (Job ID: {job.job_id}) did not produce a result table."])
+                if job.statement_type: result_rows_for_excel.append([f"Statement Type: {job.statement_type}"])
+                if hasattr(job, 'num_dml_affected_rows') and job.num_dml_affected_rows is not None: result_rows_for_excel.append([f"Rows Affected: {job.num_dml_affected_rows}"])
+            else:
+                rows_iterator = bq_client.list_rows(job.destination, timeout=DEFAULT_JOB_TIMEOUT_SECONDS)
+                if rows_iterator.schema:
+                    result_schema_names_for_excel = [field.name for field in rows_iterator.schema]
+                
+                for row_data in rows_iterator:
+                    serialized_values = []
+                    for field_name in result_schema_names_for_excel:
+                        value = row_data[field_name]
+                        if isinstance(value, bytes):
+                            try: serialized_values.append(value.decode('utf-8'))
+                            except UnicodeDecodeError: serialized_values.append(f"0x{value.hex()}")
+                        elif isinstance(value, (datetime, pd.Timestamp)):
+                            if value.tzinfo is not None: value = value.astimezone(timezone.utc).replace(tzinfo=None)
+                            serialized_values.append(value)
+                        elif isinstance(value, date): serialized_values.append(value)
+                        elif isinstance(value, time): serialized_values.append(value.isoformat())
+                        elif isinstance(value, list) or isinstance(value, dict): serialized_values.append(json.dumps(value, default=str))
+                        else: serialized_values.append(value)
+                    result_rows_for_excel.append(serialized_values)
+                logger_export.info(f"Fallback: Fetched {len(result_rows_for_excel)} result rows for job {payload.job_id}.")
+
+        # --- Write headers and rows for "Query Results" sheet ---
+        if result_schema_names_for_excel:
+            results_sheet.append(result_schema_names_for_excel)
+        for row_values in result_rows_for_excel:
+            results_sheet.append(row_values)
+        logger_export.info(f"Main query data written to Excel sheet 'Query Results'.")
+
+        # --- Sheet 2: Original SQL Query (No changes) ---
+        query_sheet = workbook.create_sheet(title="SQL Query")
+        query_sheet.cell(row=1, column=1, value="Executed SQL Query:").font = Font(bold=True)
+        query_sheet.cell(row=2, column=1, value=payload.sql)
+        query_sheet.column_dimensions['A'].width = 80
+        logger_export.info("SQL query written to Excel sheet 'SQL Query'.")
+
+        # --- Sheets 3+: Source Table Previews (No changes) ---
         source_tables = extract_fully_qualified_tables(payload.sql)
-        processed_sheet_names: Set[str] = set(["Query Results"]) 
+        processed_sheet_names: Set[str] = set(["Query Results", "SQL Query"])
 
         for table_fqn in source_tables:
-            if 'information_schema' in table_fqn.lower():
-                 logger_export.info(f"Skipping fetch for INFORMATION_SCHEMA table: {table_fqn}")
-                 continue
-
+            # ... (your existing source table preview logic - no changes needed) ...
+            if 'information_schema' in table_fqn.lower(): continue
             logger_export.info(f"Fetching preview for source table: {table_fqn} (Limit: {MAX_SOURCE_TABLE_ROWS})")
             preview_query = f"SELECT * FROM `{table_fqn}` LIMIT {MAX_SOURCE_TABLE_ROWS}"
-            
             df_source_preview = fetch_bq_data_to_dataframe(preview_query, payload.location, bq_client)
-            df_source_preview_naive = make_datetime_naive(df_source_preview.copy()) # Ensure naive datetimes
-
-            base_table_name = table_fqn.split('.')[-1]
-            sanitized_base_name = re.sub(r'[\\/*?:\[\]]', '_', base_table_name)[:25]
-            
+            df_source_preview_naive = make_datetime_naive(df_source_preview.copy())
+            base_table_name = table_fqn.split('.')[-1]; sanitized_base_name = re.sub(r'[\\/*?:\[\]]', '_', base_table_name)[:25]
             sheet_title_prefix = "Source_"
-            if 'error' in df_source_preview_naive.columns and len(df_source_preview_naive) == 1:
-                sheet_title_prefix = "Error_Source_"
-
-            sheet_name_candidate = f"{sheet_title_prefix}{sanitized_base_name}"
-            final_sheet_name = sheet_name_candidate
-            count = 1
-            while final_sheet_name.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names): # Excel limit is 31
-                suffix = f"_{count}"
-                final_sheet_name = f"{sheet_name_candidate[:31-len(suffix)]}{suffix}"
-                count += 1
-                if count > 99: # Safety break
-                    final_sheet_name = f"{sheet_title_prefix}Table_{uuid.uuid4().hex[:8]}" # Ensure unique
-                    break
-            
-            final_sheet_name = final_sheet_name[:31] # Enforce 31 char limit strictly
-            
-            # This is inside the for table_fqn in source_tables: loop
+            if 'error' in df_source_preview_naive.columns and len(df_source_preview_naive) == 1: sheet_title_prefix = "Error_Source_"
+            sheet_name_candidate = f"{sheet_title_prefix}{sanitized_base_name}"; final_sheet_name = sheet_name_candidate; count = 1
+            while final_sheet_name.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names):
+                suffix = f"_{count}"; final_sheet_name = f"{sheet_name_candidate[:31-len(suffix)]}{suffix}"; count += 1
+                if count > 99: final_sheet_name = f"{sheet_title_prefix}Table_{uuid.uuid4().hex[:8]}"; break
+            final_sheet_name = final_sheet_name[:31]
             source_sheet = workbook.create_sheet(title=final_sheet_name)
-            if df_source_preview_naive is not None and not df_source_preview_naive.empty: # Add this check
+            if df_source_preview_naive is not None and not df_source_preview_naive.empty:
                 for r_idx, row_values_tuple in enumerate(dataframe_to_rows(df_source_preview_naive, index=False, header=True), 1):
                     for c_idx, value in enumerate(row_values_tuple, 1):
-                        cell_to_write = value
-                        if pd.isna(value): # Checks for pd.NA, np.nan, None effectively
-                            cell_to_write = "" # Replace with empty string
-                        
-                        try:
-                            source_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
-                        except Exception as cell_write_error: # Catch any other rare conversion error
-                            logger_export.warning(f"Sheet '{final_sheet_name}': Error writing value {cell_to_write!r} (original: {value!r}, type: {type(value)}) to cell ({r_idx},{c_idx}). Error: {cell_write_error}. Writing fallback 'ERROR_VAL'.")
-                            source_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL") # Fallback if "" also fails
-            else:
-                source_sheet.cell(row=1, column=1, value="No data or error fetching preview.")
-            processed_sheet_names.add(final_sheet_name) # This was already there
+                        cell_to_write = "" if pd.isna(value) else value
+                        try: source_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
+                        except Exception as cell_write_error:
+                            logger_export.warning(f"Sheet '{final_sheet_name}': Error writing value {cell_to_write!r} to cell ({r_idx},{c_idx}). Error: {cell_write_error}.")
+                            source_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL")
+            else: source_sheet.cell(row=1, column=1, value="No data or error fetching preview.")
+            processed_sheet_names.add(final_sheet_name)
             logger_export.info(f"Source table preview '{table_fqn}' written to sheet '{final_sheet_name}'.")
 
-        # --- Sheet N+1: Chart Image and Info (if provided) ---
+        # --- Sheet N+1: Chart Image and Info (No changes) ---
         if payload.chart_image_base64 and payload.chart_config:
-            chart_title = f"{payload.chart_config.type.capitalize()} Chart"
-            # Ensure unique sheet name for chart
-            unique_chart_sheet_title = chart_title
-            count = 1
+            # ... (your existing chart image and info logic) ...
+            chart_title = f"{payload.chart_config.type.capitalize()} Chart"; unique_chart_sheet_title = chart_title; count = 1
             while unique_chart_sheet_title.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names):
-                suffix = f"_{count}"
-                unique_chart_sheet_title = f"{chart_title[:31-len(suffix)]}{suffix}"
-                count +=1
+                suffix = f"_{count}"; unique_chart_sheet_title = f"{chart_title[:31-len(suffix)]}{suffix}"; count +=1
             unique_chart_sheet_title = unique_chart_sheet_title[:31]
-
-            chart_info_sheet = workbook.create_sheet(title=unique_chart_sheet_title)
-            processed_sheet_names.add(unique_chart_sheet_title)
+            chart_info_sheet = workbook.create_sheet(title=unique_chart_sheet_title); processed_sheet_names.add(unique_chart_sheet_title)
             img_row_idx = 1
-            chart_info_sheet.cell(row=img_row_idx, column=1, value="Chart Type:").font = Font(bold=True)
-            chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.type)
-            img_row_idx += 1
-            chart_info_sheet.cell(row=img_row_idx, column=1, value="X-Axis:").font = Font(bold=True)
-            chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.x_axis)
-            img_row_idx += 1
-            chart_info_sheet.cell(row=img_row_idx, column=1, value="Y-Axes:").font = Font(bold=True)
-            chart_info_sheet.cell(row=img_row_idx, column=2, value=", ".join(payload.chart_config.y_axes))
-            img_row_idx +=1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="Chart Type:").font = Font(bold=True); chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.type); img_row_idx+=1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="X-Axis:").font = Font(bold=True); chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.x_axis); img_row_idx+=1
+            chart_info_sheet.cell(row=img_row_idx, column=1, value="Y-Axes:").font = Font(bold=True); chart_info_sheet.cell(row=img_row_idx, column=2, value=", ".join(payload.chart_config.y_axes)); img_row_idx+=1
             if payload.chart_config.rationale:
-                 chart_info_sheet.cell(row=img_row_idx, column=1, value="Rationale:").font = Font(bold=True)
-                 chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.rationale)
-                 img_row_idx +=1
-            img_row_idx +=1 
-
+                 chart_info_sheet.cell(row=img_row_idx, column=1, value="Rationale:").font = Font(bold=True); chart_info_sheet.cell(row=img_row_idx, column=2, value=payload.chart_config.rationale); img_row_idx+=1
+            img_row_idx+=1
             try:
-                image_data = base64.b64decode(payload.chart_image_base64)
-                image_stream = io.BytesIO(image_data)
-                img = OpenpyxlImage(image_stream)
-                chart_info_sheet.add_image(img, f"A{img_row_idx}")
-                logger_export.info(f"Chart image added to '{unique_chart_sheet_title}' sheet.")
-            except ImportError: # Specifically if Pillow is missing
-                logger_export.error("Pillow library not installed. Cannot embed chart image.")
-                chart_info_sheet.cell(row=img_row_idx, column=1, value="[Error: Pillow library not installed. Chart image cannot be embedded.]")
-            except Exception as img_e:
-                logger_export.error(f"Failed to decode or add image to Excel: {img_e}", exc_info=True)
-                chart_info_sheet.cell(row=img_row_idx, column=1, value=f"[Error embedding chart image: {str(img_e)}]")
+                image_data = base64.b64decode(payload.chart_image_base64); image_stream = io.BytesIO(image_data); img = OpenpyxlImage(image_stream); chart_info_sheet.add_image(img, f"A{img_row_idx}")
+            except Exception as img_e: logger_export.error(f"Failed to add image: {img_e}", exc_info=True)
 
-        # --- Sheet N+2: Raw Chart Data (if chart was provided) ---
-        if payload.chart_data and payload.chart_image_base64: 
-            chart_data_title = "Chart Source Data"
-            unique_chart_data_sheet_title = chart_data_title
-            count = 1
+
+        # --- Sheet N+2: Raw Chart Data (No changes needed, uses payload.chart_data) ---
+        if payload.chart_data: # Use chart_data instead of chart_image_base64 as the condition
+            # ... (your existing chart data sheet logic) ...
+            # This part already correctly uses payload.chart_data which is the filtered data.
+            chart_data_title = "Chart Source Data"; unique_chart_data_sheet_title = chart_data_title; count = 1
             while unique_chart_data_sheet_title.lower()[:31] in (name.lower()[:31] for name in processed_sheet_names):
-                suffix = f"_{count}"
-                unique_chart_data_sheet_title = f"{chart_data_title[:31-len(suffix)]}{suffix}"
-                count +=1
+                suffix = f"_{count}"; unique_chart_data_sheet_title = f"{chart_data_title[:31-len(suffix)]}{suffix}"; count +=1
             unique_chart_data_sheet_title = unique_chart_data_sheet_title[:31]
-            
-            chart_data_sheet = workbook.create_sheet(title=unique_chart_data_sheet_title)
-            processed_sheet_names.add(unique_chart_data_sheet_title)
-            
+            chart_data_sheet = workbook.create_sheet(title=unique_chart_data_sheet_title); processed_sheet_names.add(unique_chart_data_sheet_title)
             df_chart = pd.DataFrame(payload.chart_data)
             df_chart_naive = make_datetime_naive(df_chart.copy())
-            # In the section "Sheet N+2: Raw Chart Data"
-            # After df_chart_naive = make_datetime_naive(df_chart.copy())
-            if not df_chart_naive.empty: # Add this check
+            if not df_chart_naive.empty:
                 for r_idx, row_val_list in enumerate(dataframe_to_rows(df_chart_naive, index=False, header=True), 1):
                     for c_idx, value in enumerate(row_val_list, 1):
-                        cell_to_write = value
-                        if pd.isna(value):
-                            cell_to_write = ""
-                        
-                        try:
-                            chart_data_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
-                        except Exception as cell_write_error_chart:
-                            logger_export.warning(f"Sheet '{unique_chart_data_sheet_title}': Error writing value {cell_to_write!r} (original: {value!r}, type: {type(value)}) to cell ({r_idx},{c_idx}). Error: {cell_write_error_chart}. Writing fallback 'ERROR_VAL'.")
-                            chart_data_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL")
-            for r_idx, row_val_list in enumerate(dataframe_to_rows(df_chart_naive, index=False, header=True), 1):
-                for c_idx, value in enumerate(row_val_list, 1):
-                    chart_data_sheet.cell(row=r_idx, column=c_idx, value=value)
+                        cell_to_write = "" if pd.isna(value) else value
+                        try: chart_data_sheet.cell(row=r_idx, column=c_idx, value=cell_to_write)
+                        except Exception: chart_data_sheet.cell(row=r_idx, column=c_idx, value="ERROR_VAL")
             logger_export.info(f"Chart source data ({len(df_chart_naive)} rows) added to '{unique_chart_data_sheet_title}' sheet.")
 
 
@@ -412,17 +380,13 @@ def export_query_to_excel( # Renamed to match your previous working one
         workbook.save(excel_buffer)
         excel_buffer.seek(0)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") # Use UTC
         filename = f"query_export_{payload.job_id[:8]}_{timestamp}.xlsx"
         
-        headers = {
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            # ExcelWriter with openpyxl automatically sets the correct MIME type for .xlsx
-        }
-        logger_export.info(f"Successfully generated Excel export: {filename}")
+        headers = { 'Content-Disposition': f'attachment; filename="{filename}"' }
         return StreamingResponse(
             excel_buffer,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # Explicitly set
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers
         )
 

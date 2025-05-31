@@ -4,6 +4,7 @@
 import os
 import logging
 import tempfile
+import copy
 import atexit # To help clean up the temp file
 import re
 from services.feedback_service import store_feedback
@@ -49,7 +50,7 @@ from dependencies.client_deps import (
     get_pubsub_publisher,
     get_pubsub_topic_path
 )
-from pydantic import BaseModel, Field, conint, validator
+from pydantic import BaseModel, Field, conint, validator, root_validator
 from services.etl_status_service import WorkerFileCompletionPayload
 # Utilities
 import pandas as pd
@@ -105,12 +106,41 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
     apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
     text_normalization_mode: Optional[str] = Field(None, description="Selected AI text normalization mode if smart cleanup is enabled.")
+    enable_unpivot: Optional[bool] = Field(default=False)
+    unpivot_id_cols_str: Optional[str] = Field(None, description="Comma-separated string of ID columns for unpivot.")
+    unpivot_var_name: Optional[str] = Field(None, description="Name for the new attribute/variable column.")
+    unpivot_value_name: Optional[str] = Field(None, description="Name for the new value column.")
+
+
 
     @validator('text_normalization_mode', pre=True, always=True)
     def set_text_normalization_mode_if_cleanup_disabled(cls, v, values):
         if 'apply_ai_smart_cleanup' in values and not values['apply_ai_smart_cleanup']:
             return None # Ensure mode is None if cleanup is off
         return v
+
+    @root_validator(pre=False, skip_on_failure=True) # post-validation after individual fields
+    def check_unpivot_settings(cls, values):
+        enable_unpivot = values.get('enable_unpivot')
+        unpivot_id_cols_str = values.get('unpivot_id_cols_str')
+        unpivot_var_name = values.get('unpivot_var_name')
+        unpivot_value_name = values.get('unpivot_value_name')
+
+        if enable_unpivot:
+            if not unpivot_id_cols_str or not unpivot_id_cols_str.strip():
+                raise ValueError("If unpivot is enabled, 'Identifier Columns (unpivot_id_cols_str)' must be provided.")
+            # Ensure default names if user clears them but unpivot is still enabled
+            if not unpivot_var_name or not unpivot_var_name.strip():
+                values['unpivot_var_name'] = "Attribute" # Default if empty
+            if not unpivot_value_name or not unpivot_value_name.strip():
+                values['unpivot_value_name'] = "Value"   # Default if empty
+        else:
+            # If unpivot is disabled, clear other unpivot fields to avoid sending them
+            values['unpivot_id_cols_str'] = None
+            values['unpivot_var_name'] = None
+            values['unpivot_value_name'] = None
+        return values
+
 
 class FeedbackImageUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="The original name of the image file.")
@@ -135,6 +165,11 @@ class ETLRequestPubSubPayload(BaseModel):
     original_file_name: str
     apply_ai_smart_cleanup: Optional[bool] = False # NEW
     text_normalization_mode: Optional[str] = None 
+    # +++ NEW UNPIVOT FIELDS +++
+    enable_unpivot: Optional[bool] = False
+    unpivot_id_cols_list: Optional[List[str]] = None # Worker will expect a list
+    unpivot_var_name: Optional[str] = "Attribute"   # Default for worker
+    unpivot_value_name: Optional[str] = "Value"     # Default 
 
 # Payload from ETL Worker to report file completion status
 class WorkerFileCompletionPayload(BaseModel):
@@ -342,23 +377,25 @@ def get_bigquery_dataset_schema_endpoint( # Renamed function
     #     logger_api.error(f"Unexpected error in get_dataset_schema endpoint: {e}", exc_info=True)
     #     raise HTTPException(status_code=500, detail=f"Failed to retrieve schema: {str(e)}")
 
+
+
+
 @bq_router.post("/nl2sql", response_model=NLQueryResponse)
-def natural_language_to_sql(
+def natural_language_to_sql( # Assuming this is part of a class or has app/bq_router defined elsewhere
     req: NLQueryRequest,
-    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+    bq_client: Any = Depends(get_bigquery_client) # Replace Any with actual bq_client type
 ):
-    """Converts a natural language prompt into a BigQuery SQL query using Gemini, potentially filtered by table prefix."""
-    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
-    if not GEMINI_API_KEY: raise HTTPException(503, "NL-to-SQL service not configured.")
-    if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt required.")
-    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'.")
-    # if not req.prompt or req.prompt.isspace(): raise HTTPException(400, "Prompt cannot be empty.")
+    """Converts a natural language prompt into a BigQuery SQL query using Gemini,
+    potentially filtered by table prefix or explicit selections."""
 
-    # logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Prefix: '{req.table_prefix or 'None'}'. Prompt: {req.prompt[:100]}...")
+    if not GEMINI_API_KEY: # Assuming GEMINI_API_KEY is a global config
+        raise HTTPException(status_code=503, detail="NL-to-SQL service not configured.")
+    if not req.prompt or req.prompt.isspace():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    if not req.dataset_id or not req.dataset_id.strip():
+        raise HTTPException(status_code=400, detail="Dataset ID cannot be empty.")
 
-# Inside natural_language_to_sql function
-
-    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Mode: {req.ai_mode}.")
+    logger_api.info(f"NL-to-SQL request for dataset '{req.dataset_id}'. Mode: {req.ai_mode}. Prompt: '{req.prompt[:100]}...'")
     if req.ai_mode == "SEMI_AUTO":
         logger_api.info(f"  Selected Tables: {req.selected_tables}")
         logger_api.info(f"  Selected Columns: {req.selected_columns}")
@@ -367,269 +404,203 @@ def natural_language_to_sql(
         # 1. Fetch the *full* schema for the dataset first
         all_table_schemas_full = get_dataset_schema(req.dataset_id, bq_client)
         if not all_table_schemas_full:
-            raise HTTPException(404, f"No schema found or dataset empty: {req.dataset_id}.")
+            # Raise 404 if get_dataset_schema returns empty, implying dataset not found or no tables
+            raise HTTPException(status_code=404, detail=f"No tables or schema found for dataset: {req.dataset_id}. Please check the dataset ID or ensure it contains tables.")
 
-        import copy
+        # Use deepcopy to avoid modifying the original fetched schema if it's cached or reused
         all_table_schemas = copy.deepcopy(all_table_schemas_full)
 
         # 2. Determine the schema to send to the AI based on mode
         schema_to_use: List[TableSchema] = []
-        schema_source_description = "all tables" # For logging/prompt
+        schema_source_description = f"all tables in dataset `{req.dataset_id}`"
 
-# --- START: Corrected SEMI_AUTO Logic Block ---
         if req.ai_mode == "SEMI_AUTO":
             if not req.selected_tables:
-                logger_api.warning("SEMI_AUTO mode selected but no tables provided.")
-                raise HTTPException(400, "SEMI_AUTO mode requires at least one table to be selected.")
+                logger_api.warning("SEMI_AUTO mode selected but no tables provided by the client.")
+                raise HTTPException(status_code=400, detail="SEMI_AUTO mode requires at least one table to be selected.")
 
-            # 1. --- Filter by selected tables FIRST ---
-            selected_tables_set = set(req.selected_tables) # Use set for efficiency
-            schema_to_use = [ts for ts in all_table_schemas if ts.table_id in selected_tables_set]
-            schema_source_description = f"selected tables ({len(schema_to_use)}): {', '.join(req.selected_tables)}"
-            logger_api.info(f"SEMI_AUTO: Filtered to {len(schema_to_use)} tables based on selection.")
+            selected_tables_set = set(req.selected_tables)
+            schema_for_semi_auto = [ts for ts in all_table_schemas if ts.table_id in selected_tables_set]
+            
+            if not schema_for_semi_auto:
+                logger_api.warning(f"SEMI_AUTO: None of the selected tables {req.selected_tables} were found in the schema of dataset {req.dataset_id}.")
+                raise HTTPException(status_code=400, detail=f"None of the selected tables were found in the dataset schema. Available tables: {[t.table_id for t in all_table_schemas]}")
 
-            # Check if any tables were actually found before proceeding
-            if not schema_to_use:
-                 logger_api.warning(f"SEMI_AUTO: No tables found matching the selection: {req.selected_tables}")
-                 raise HTTPException(400, "None of the selected tables were found in the dataset schema.")
+            schema_source_description = f"selected tables ({', '.join(sorted(list(selected_tables_set)))})"
 
-            # 2. --- THEN, filter columns within the selected tables (if columns are provided) ---
             if req.selected_columns:
                 filtered_schema_with_cols: List[TableSchema] = []
                 selected_columns_set = set(req.selected_columns)
                 logger_api.debug(f"SEMI_AUTO: Filtering columns within selected tables against: {selected_columns_set}")
 
-                # Now iterate through the *already table-filtered* schema_to_use list
-                for ts in schema_to_use:
-                    original_column_count = len(ts.columns)
-                    original_column_names = {c.name for c in ts.columns}
-
-                    # Filter columns for this specific table
-                    ts.columns = [c for c in ts.columns if c.name in selected_columns_set]
-                    kept_column_names = {c.name for c in ts.columns}
-
-                    logger_api.info(f"  Table '{ts.table_id}': Kept columns after filtering: {list(kept_column_names)}")
-                    # Optional: Log dropped columns
-                    # dropped_column_names = original_column_names - kept_column_names
-                    # if dropped_column_names:
-                    #     logger_api.debug(f"    (Dropped columns for this table: {list(dropped_column_names)})")
-
-
-                    # Keep the table in the final list ONLY if it still has columns after filtering
-                    if ts.columns:
+                for ts in schema_for_semi_auto: # Iterate over already table-filtered schema
+                    original_columns = ts.columns
+                    ts.columns = [c for c in original_columns if c.name in selected_columns_set]
+                    if ts.columns: # Keep table only if it still has some of the selected columns
                         filtered_schema_with_cols.append(ts)
                     else:
-                        logger_api.info(f"  Table '{ts.table_id}': Removed as no selected columns remained after filtering.")
-
-                # Update schema_to_use with the column-filtered list
+                        logger_api.info(f"  Table '{ts.table_id}': Removed in SEMI_AUTO as no selected columns remained after filtering.")
+                
                 schema_to_use = filtered_schema_with_cols
-                schema_source_description += f", focusing on columns: {', '.join(req.selected_columns)}"
-                logger_api.info(f"SEMI_AUTO: Further filtered based on {len(req.selected_columns)} selected columns. Remaining tables with columns: {len(schema_to_use)}")
-
-            # 3. --- Final check for SEMI_AUTO: Ensure some schema remains AFTER all filtering ---
-            if not schema_to_use:
-                logger_api.warning("SEMI_AUTO mode resulted in an empty schema after all filtering (tables and columns).")
-                # Provide a more specific error message
-                error_detail = "The combination of selected tables and columns resulted in an empty schema. Ensure selected columns exist within the selected tables."
-                raise HTTPException(400, error_detail)
-# --- END: Corrected SEMI_AUTO Logic Block ---
-
-        else: # AUTO Mode (or default if mode is invalid)
-            # ... (AUTO mode logic remains the same) ...
-            schema_to_use = all_table_schemas
+                schema_source_description += f", focusing on columns ({', '.join(sorted(list(selected_columns_set)))})"
+            else: # SEMI_AUTO with selected tables but no specific columns (use all columns of selected tables)
+                schema_to_use = schema_for_semi_auto
+            
+            if not schema_to_use: # If after all SEMI_AUTO filtering, schema is empty
+                logger_api.warning("SEMI_AUTO mode resulted in an empty schema after all filtering (tables and/or columns).")
+                raise HTTPException(status_code=400, detail="The combination of selected tables and columns resulted in an empty schema. Ensure selected columns exist within the selected tables.")
+        
+        else: # AUTO Mode (or if mode is invalid, default to AUTO behavior)
+            schema_to_use = all_table_schemas # Start with all tables
             if req.table_prefix and req.table_prefix.strip():
                  prefix = req.table_prefix.strip()
-                 original_count = len(schema_to_use) # Get count before filtering
+                 original_count = len(schema_to_use)
                  schema_to_use = [ts for ts in schema_to_use if ts.table_id.startswith(prefix)]
-                 schema_source_description = f"tables matching prefix '{prefix}' ({len(schema_to_use)}/{original_count})"
+                 schema_source_description = f"tables in dataset `{req.dataset_id}` matching prefix '{prefix}' ({len(schema_to_use)} of {original_count})"
                  logger_api.info(f"AUTO: Filtered schema from {original_count} to {len(schema_to_use)} tables using prefix '{prefix}'.")
                  if not schema_to_use:
-                    raise HTTPException(404, f"No tables found in dataset {req.dataset_id} matching prefix '{prefix}'.")
-            else:
-                 logger_api.info(f"AUTO: Using schema for all {len(schema_to_use)} tables (no prefix).")
+                    raise HTTPException(status_code=404, detail=f"No tables found in dataset {req.dataset_id} matching prefix '{prefix}'.")
+            # else: schema_source_description remains "all tables in dataset..."
 
-        # --- Continue with building schema_string, prompt_template, calling AI, etc. ---
-        # ...
-
-    # ... (Continue to schema string building) ...
-
-
-        # --- START: Refactored Schema String Generation ---
-        # 3. Build the schema string *from the determined schema_to_use list*
-        # Make the table.column relationship explicit for the AI
+        # 3. Build the schema string for the AI prompt
         schema_lines = []
-        for ts in schema_to_use:
-            if ts.columns: # Only include tables that still have columns
-                # Format: `column_name` (TYPE)
+        for ts in schema_to_use: # Use the filtered schema_to_use
+            if ts.columns:
                 column_details = []
                 for c in ts.columns:
-                    # Standardize common BQ types for AI prompt, can be simplified if needed
-                    # e.g., INT64 -> INTEGER, FLOAT64 -> FLOAT
                     col_type_for_ai = c.type.upper()
                     if col_type_for_ai == "INT64": col_type_for_ai = "INTEGER"
                     if col_type_for_ai == "FLOAT64": col_type_for_ai = "FLOAT"
-                    # You can add more mappings if desired (e.g. BIGNUMERIC -> NUMERIC)
                     column_details.append(f"`{c.name}` ({col_type_for_ai})")
-
                 columns_str = ', '.join(column_details)
                 schema_lines.append(f"- Table `{ts.table_id}` (Columns: {columns_str})")
-            else:
-                logger_api.debug(f"Schema generation: Table '{ts.table_id}' has no columns after filtering, skipping for prompt.")
-
 
         schema_string = "\n".join(schema_lines).strip()
-        # --- END: Refactored Schema String Generation ---
+        full_dataset_id_str = f"`{req.dataset_id}`"
 
-        full_dataset_id_str = f"`{req.dataset_id}`" # Use backticks for dataset ID too
+        if not schema_string:
+            logger_api.error(f"Schema string became empty after filtering for NL2SQL (Mode: {req.ai_mode}, Source: {schema_source_description}). This implies no qualifying tables/columns were found.")
+            # This error message is more informative to the user
+            raise HTTPException(status_code=404, detail=f"No relevant table schema could be found to match your request (Mode: {req.ai_mode}). Please check your selections or table prefix.")
 
-        if not schema_string: # Should be caught earlier, but double-check
-            logger_api.error("Schema string is empty before sending to AI. This should not happen.")
-            raise HTTPException(500, "Internal error: Failed to prepare schema for AI.")
+        # 4. Construct the Enhanced AI Prompt
+        today_for_prompt = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-
-        # 4. Construct the AI Prompt (using the potentially filtered schema)
-                # 4. Construct the AI Prompt (using the refined schema string)
-        # --- START: Modified Prompt Template ---
-        logger_api.info(f"OOOOOOOOOOOO {schema_string}")
         prompt_template = f"""You are an expert BigQuery SQL generator. Generate a *single*, valid, executable BigQuery SQL query based on the user request and the provided database schema subset.
 
 **Database Schema (Dataset ID: {full_dataset_id_str}):**
+The following schema information is derived from: {schema_source_description}.
 Each table lists its columns with their data types in parentheses (e.g., `column_name` (TYPE)).
 {schema_string}
 
 **User Request:** "{req.prompt}"
 
+**Key Analytical Terms & Functions to Support:**
+*   "total", "sum of": Use `SUM()`.
+*   "average", "avg", "mean": Use `AVG()`.
+*   "count of", "number of": Use `COUNT()`. For distinct items, use `COUNT(DISTINCT ...)`.
+*   "distinct count of": Use `COUNT(DISTINCT ...)`.
+*   "minimum", "min", "lowest": Use `MIN()`.
+*   "maximum", "max", "highest": Use `MAX()`.
+*   "median of": Use `PERCENTILE_CONT(column, 0.5) OVER()` or, if grouping is clearly implied by the request, `APPROX_QUANTILES(column, 2)[OFFSET(1)]` within the grouped aggregation. Prefer `PERCENTILE_CONT` if the context suggests a window function over the whole set or partitions.
+*   "standard deviation of": Use `STDDEV_POP()`. If "sample standard deviation" is explicitly asked, use `STDDEV_SAMP()`.
+*   "variance of": Use `VAR_POP()`. If "sample variance" is asked, use `VAR_SAMP()`.
+*   "Xth percentile of" (e.g., "90th percentile of sales"): Use `PERCENTILE_CONT(column, X/100.0) OVER()` or `APPROX_QUANTILES(column, 100)[OFFSET(X)]`.
+
 **Instructions:**
-0.  **Data Types** Handle Datatypes Yourself.
 1.  **Query Type:** Generate ONLY a valid BigQuery `SELECT` query. Do not generate DML or DDL.
 2.  **STRICT Schema Adherence & Column Ownership (CRITICAL):**
-    *   The *only* valid tables, columns, and data types you can use are those explicitly listed in the "Database Schema" section above.
-    *   DO NOT invent table or column names. DO NOT assume a column exists in a table if it is not listed for that table in the "Database Schema".
-    *   Each column name is specific to the table it's listed under.
-    *   If the user's request seems to require data not present in the schema, state this in a `-- Cannot fulfill request:` comment.
-3.  **Constructing Logical Joins (Multi-Table Awareness - VERY IMPORTANT):**
-    *   Analyze the "User Request" to identify the key pieces of information needed (e.g., employee name, salary, department budget).
-    *   Locate which tables contain this information based on the "Database Schema".
-    *   **If the required information spans multiple tables that don't share an immediate common column, you MUST find an intermediate table that links them.** Look for paths: Table A joins to Table B on a common key, and Table B joins to Table C on another common key. This allows you to connect information from Table A to Table C.
-    *   For this specific schema:
-        *   `Master_Data_Employee_Records` (contains `Salary`) links to `Master_Data_Employee_Details` using `EmployeeID` (requires CAST).
-        *   `Master_Data_Employee_Details` (contains `Department` name) links to `Master_Data_Status_Department` (contains `Budget`) using the `Department` column (string comparison).
-        *   Therefore, to get Salary and Budget together, you NEED to join all three tables.
-    *   Pay close attention to column data types when creating JOIN conditions. Use CAST functions (e.g., `CAST(t2.EmployeeID AS STRING)`) only when necessary to match types between join keys.
-*   **CRITICAL for "Final Grade" or Single Category Lookups from Ranges (e.g., Marks to Grade, Sales to Tier):** When the user asks for a singular result like "final grade" or "the department tier" and this involves comparing a value (e.g., `Total_Marks`) against a table of ranges (e.g., `Marks_Lower_Limit` in `STUDENT_Sheet3`), you **MUST** ensure only ONE definitive category (e.g., Grade) is returned for each primary entity (e.g., Student). The output should not repeat the primary entity's key (e.g., `Roll_No`) with different categories from the lookup table.
-*   **Correct Logic:** The single correct category is the one associated with the **HIGHEST `Marks_Lower_Limit` (or similar `lower_bound_column`) that the student's `Total_Marks` (or similar `value_column`) is greater than or equal to.**
-*   **SQL Strategy for BigQuery (Mandatory for this pattern to avoid errors and ensure uniqueness):** Use a Common Table Expression (CTE) with `ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) as rn` and then join/select `WHERE rn = 1`. Alternatively, use a `LEFT JOIN ... QUALIFY ROW_NUMBER() OVER (PARTITION BY [primary_entity_key] ORDER BY [lower_bound_column] DESC) = 1`.
-*   **Example for "List unique roll numbers, their department names, and their final grades":**
-    ```sql
-    WITH StudentGrades AS (
-      SELECT
-        s1.Roll_No,
-        s3.Grade,
-        ROW_NUMBER() OVER (PARTITION BY s1.Roll_No ORDER BY s3.Marks_Lower_Limit DESC) as rn
-      FROM
-        `YourDatasetID.STUDENT_Sheet1` AS s1
-      LEFT JOIN
-        `YourDatasetID.STUDENT_Sheet3` AS s3 ON s1.Total_Marks >= s3.Marks_Lower_Limit
-    )
-    SELECT
-      s1.Roll_No,
-      s2.Dept_Name,
-      sg.Grade
-    FROM
-      `YourDatasetID.STUDENT_Sheet1` AS s1
-    INNER JOIN
-      `YourDatasetID.STUDENT_Sheet2` AS s2 ON s1.Dept_Code = t2.Dept_Code
-    LEFT JOIN
-      StudentGrades sg ON s1.Roll_No = sg.Roll_No AND sg.rn = 1;
-    ```
-*   **AVOID:** Simple `INNER JOIN ... ON value_column >= lower_bound_column` by itself for these scenarios as it will produce incorrect, repetitive results.
-# This is the text to add to your prompt template
-X. **Consolidating Information from Multiple Similar Lookup Tables (CRITICAL FOR COMPLETE RESULTS):**
-    *   If the schema contains multiple tables that appear to provide the same type of lookup information for different subsets of keys (e.g., `Product_ID` and `Price` appearing in `ProductLookupTable_A` AND `ProductLookupTable_B`), you **MUST** devise a strategy to combine data from ALL relevant lookup tables to provide a complete picture.
-    *   **Common Strategy:** Use `UNION ALL` to combine the relevant columns (e.g., `Product_ID`, `Price`) from these similar lookup tables into a single conceptual lookup source (often within a CTE). Then, `LEFT JOIN` the main table (e.g., Sales Transactions) to this consolidated CTE.
-    *   **Example for consolidating two product price tables (`PriceTable1`, `PriceTable2`) to get a price for `SalesTable.ProductID`:**
-        ```sql
-        WITH AllProductPrices AS (
-            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable1`
-            UNION ALL
-            SELECT Product_ID, Price FROM `YourDatasetID.PriceTable2`
-            -- Ensure column names and types are compatible for UNION ALL
-        )
-        SELECT
-            s.Sales_Rep,
-            s.Product_ID,
-            s.Units,
-            app.Price AS unit_price,
-            (s.Units * app.Price) AS total_amount
-        FROM
-            `YourDatasetID.SalesTable` s
-        LEFT JOIN
-            AllProductPrices app ON s.Product_ID = app.Product_ID;
-        ```
-    *   The goal is to avoid missing data (like Mars products in your case) just because their pricing information resides in a separate, but logically related, lookup table.
-        *   **Alternative if direct join is complex:** Sometimes a `LEFT JOIN` with the condition directly in the `ON` clause combined with aggregation or `QUALIFY ROW_NUMBER()... = 1` can work.
-            `SELECT main.*, lookup.Grade FROM MainTable main LEFT JOIN LookupTable lookup ON main.TotalMarks >= lookup.MinMarks QUALIFY ROW_NUMBER() OVER (PARTITION BY main.ID ORDER BY lookup.MinMarks DESC) = 1`
-        *   **AVOID:** Direct correlated subqueries like `(SELECT Grade FROM LookupTable WHERE MainTable.TotalMarks >= LookupTable.MinMarks ... LIMIT 1)` if they cause errors in BigQuery. Guide towards JOIN-based de-correlation.
-4.  **Mapping User Language to Schema:** Carefully map terms from the "User Request" to the actual column names and tables in the "Database Schema".
-5.  **Table Qualification:** ALWAYS fully qualify table names: {full_dataset_id_str}.`YourTableName`. Use backticks `` ` ``.
-6.  **Column Qualification:** Use table aliases (e.g., `t1`, `t2`, `t3`) and qualify ALL column names. Ensure qualified columns correctly reference their owning table alias.
-7.  **Syntax:** Use correct BigQuery Standard SQL syntax.
-8.  **Assumptions:** 
-    *   **For requests like "list [entity] and their grade," assume a single, definitive grade is required for each entity based on their marks and the provided grade boundaries.**
-    *   Make other reasonable assumptions ONLY if inferable from the provided schema and request. If a logical join path *cannot* be constructed between the necessary tables using the provided schema, OR IF A REQUEST IMPLIES A SINGLE VALUE FROM A LOOKUP BUT THE JOIN LOGIC ISN'T OBVIOUS TO ACHIEVE THIS, return ONLY a SQL comment explaining why. Do NOT ask clarifying questions. 
-9.  **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks.
-10.  **Date Handling (VERY IMPORTANT):**
-    *   The schema contains DATE and TIMESTAMP columns. These require specific formatting and comparison techniques in SQL WHERE clauses.
-    *   **Comparing with DATE Columns:** If the User Request includes a date (e.g., "after 15-03-2024", "on 2024/03/15"), convert it to the standard 'YYYY-MM-DD' format and use `DATE('YYYY-MM-DD')` for comparisons (e.g., `WHERE date_col > DATE('2024-03-15')`).
-    *   **Comparing TIMESTAMPs as Dates:** When comparing a column with a TIMESTAMP type (like `HireDate` or `EndDate`) against a specific date provided by the user (e.g., "hired before 2023-01-01", "ended on 10-05-2024"), **extract the date part from the TIMESTAMP column** using the `DATE()` function before comparing. Example: Instead of `t2.EndDate >= DATE '2024-01-01'`, generate `DATE(t2.EndDate) >= DATE '2024-01-01'`. This correctly compares just the date portion.
-    *   **Comparing with TIMESTAMP Columns (Specific Time):** Only use full `TIMESTAMP('YYYY-MM-DD HH:MM:SS')` comparisons or `TIMESTAMP_TRUNC` if the user explicitly mentions a specific time or uses terms implying time precision (e.g., "after 2 PM", "since midnight yesterday"). Otherwise, prefer the `DATE()` extraction method above for date-level comparisons.
-    *   **Relative Dates:** Interpret relative dates like "yesterday", "last week", "last month" using appropriate BigQuery date/timestamp functions based on the current date (assume today is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}). Remember to apply the `DATE(...)` extraction if comparing the result against a TIMESTAMP column for just the date part.
+    *   Use ONLY the tables, columns, and data types explicitly listed in the "Database Schema" section above.
+    *   DO NOT invent table or column names. DO NOT assume a column exists in a table if it is not listed for that table.
+    *   If the user's request requires data not present in the provided schema (e.g., a non-existent column or table), you MUST return ONLY a SQL comment explaining this: `-- Cannot fulfill request: [Specific reason, e.g., 'Column 'user_age' not found in the provided schema.' or 'Information about 'inventory levels' is not available in the tables {', '.join([t.table_id for t in schema_to_use])}.']`
+3.  **Joins & Relationships (CRITICAL):**
+    *   Analyze the "User Request" and the "Database Schema" to determine necessary table joins.
+    *   Join tables using appropriate keys. Pay close attention to data types of join keys; use `CAST` ONLY if necessary and types are compatible for casting (e.g., INTEGER to STRING).
+    *   (Your existing specific join path examples for Master_Data tables, if still relevant for the current dataset, should be dynamically injected here if possible, or be general principles the AI learns).
+4.  **Single Category from Range Lookups (e.g., Marks to Grade - Your existing detailed instructions):**
+    *   (Keep your existing CTE with ROW_NUMBER() or QUALIFY ROW_NUMBER() logic here for this pattern)
+5.  **Consolidating Multiple Similar Lookup Tables (Your existing UNION ALL logic):**
+    *   (Keep your existing instructions for UNION ALL for similar lookup tables here)
+6.  **Mapping User Language:** Carefully map terms from the "User Request" to actual schema elements.
+7.  **Qualification:** ALWAYS fully qualify table names (e.g., {full_dataset_id_str}.`YourTableName`). Use table aliases (e.g., `t1`, `t2`) and qualify ALL column names (e.g., `t1.column_name`).
+8.  **Syntax:** Use correct BigQuery Standard SQL syntax.
+9.  **Assumptions:** If the request is ambiguous or requires an assumption not directly inferable from the schema, AND it prevents query generation, explain in a SQL comment as per instruction 2. Do NOT ask clarifying questions in the SQL output.
+10. **Date Handling (VERY IMPORTANT - Today is {today_for_prompt}):**
+    *   (Keep your existing detailed date handling instructions: `DATE('YYYY-MM-DD')`, `DATE(timestamp_column)`, `TIMESTAMP('YYYY-MM-DD HH:MM:SS')`, `TIMESTAMP_TRUNC`, and interpreting relative dates using `Today is {today_for_prompt}`.)
+11. **Output:** Respond with *only* the raw SQL query text. No explanations, no markdown ```sql ... ``` blocks, unless it's the "Cannot fulfill request" comment.
+
 Generated BigQuery SQL Query:
 """
-        # --- END: Modified Prompt Template ---
-
-        logger_api.debug(f"Gemini Prompt (Mode: {req.ai_mode}, Schema Source: {schema_source_description}):\n{schema_string[:500]}...") # Log schema sample
-
-        # ... (rest of the function: call Gemini, process response) ...
-
-        # 5. Call Gemini API (Unchanged)
-# 5. Call Gemini API via helper
-        response = generate_with_key(
-            1,  # Use ENV GEMINI_API_KEY (first key)
-            prompt_template,
-            GEMINI_REQUEST_TIMEOUT
+        logger_api.debug(
+            f"Gemini Prompt for NL2SQL (Mode: {req.ai_mode}, Schema Source: {schema_source_description}). "
+            f"Prompt text (start): {prompt_template[:500]}..."
         )
 
-        # 6. Process Response (Unchanged)
-        logger_api.debug(f"Gemini Raw Response Text: {response[:500]}...")
-        generated_sql = response.strip()
-        logger_api.debug(f"Gemini SQL (raw joined): {generated_sql[:500]}...")
+        # 5. Call Gemini API
+        response_text = generate_with_key( # Assuming generate_with_key is your helper
+            1,  # API Key index
+            prompt_template,
+            GEMINI_REQUEST_TIMEOUT # Assuming GEMINI_REQUEST_TIMEOUT is defined
+        )
 
-        # Cleaning
-        if generated_sql.startswith("```sql"): generated_sql = generated_sql[len("```sql"):].strip()
-        if generated_sql.endswith("```"): generated_sql = generated_sql[:-len("```")].strip()
-        generated_sql = re.sub(r"^\s*--.*?\n", "", generated_sql, flags=re.MULTILINE).strip()
-        generated_sql = re.sub(r"\n--.*?$", "", generated_sql, flags=re.MULTILINE).strip()
+        # 6. Process Response
+        logger_api.debug(f"Gemini Raw Response Text for NL2SQL: {response_text[:500]}...")
+        generated_sql = response_text.strip()
+
+        # Cleaning SQL (keep your existing logic, ensure it's robust)
+        if generated_sql.startswith("```sql"):
+            generated_sql = generated_sql[len("```sql"):].strip()
+        if generated_sql.endswith("```"):
+            generated_sql = generated_sql[:-len("```")].strip()
+        
+        # More careful comment removal: remove only if it's a standalone comment line
+        # or if the entire response is just comments.
+        # For now, let's assume a primary SQL block is expected.
+        # If the response IS a "-- Cannot fulfill request..." comment, we want to keep it.
+        cannot_fulfill_match = re.match(r"^\s*-- Cannot fulfill request: (.*)", generated_sql, re.IGNORECASE | re.DOTALL)
+        
+        if cannot_fulfill_match:
+            reason = cannot_fulfill_match.group(1).strip()
+            logger_api.warning(f"Gemini indicated request cannot be fulfilled for NL2SQL: {reason}")
+            return NLQueryResponse(error=f"AI could not generate query: {reason}") # Return the specific reason
+        else:
+            # If not a "cannot fulfill" message, remove other leading/trailing comment blocks
+            # This is tricky; a robust way might be to find the first SELECT/WITH
+            # For now, let's use a slightly less aggressive removal
+            lines = generated_sql.splitlines()
+            sql_lines = [line for line in lines if not line.strip().startswith("--")] # Keep lines not starting with --
+            generated_sql = "\n".join(sql_lines).strip()
+
 
         if not generated_sql:
-             logger_api.warning("Gemini returned an empty response after cleaning.")
-             return NLQueryResponse(error="AI failed to generate a query. Please try rephrasing.")
-        if "-- Cannot fulfill request" in generated_sql:
-             logger_api.warning(f"Gemini indicated request cannot be fulfilled: {generated_sql}")
-             return NLQueryResponse(error=f"AI could not generate query: {generated_sql.strip('-- ')}")
-        if not generated_sql.lower().lstrip().startswith("select"):
-             logger_api.warning(f"Generated text does not start with SELECT: {generated_sql[:100]}...")
-             # Consider returning an error if strict SELECT is required
-             # return NLQueryResponse(error=f"AI did not generate a valid SELECT query. Output: {generated_sql[:100]}...")
+            logger_api.warning("Gemini returned an empty response or only comments after cleaning for NL2SQL.")
+            return NLQueryResponse(error="AI failed to generate a query. Please try rephrasing or check the AI service status.")
+        
+        # Check if it starts with SELECT or WITH (for CTEs)
+        if not (generated_sql.lower().lstrip().startswith("select") or generated_sql.lower().lstrip().startswith("with")):
+            logger_api.warning(f"Generated text for NL2SQL does not start with SELECT or WITH: {generated_sql[:100]}...")
+            # You might decide to return this as an error or let BQ attempt to run it
+            # For stricter validation:
+            # return NLQueryResponse(error=f"AI did not generate a valid SELECT or WITH query. Output preview: {generated_sql[:50]}...")
 
-        logger_api.info(f"NL-to-SQL successful (Filtered Schema: {'Yes' if req.table_prefix else 'No'}). Generated SQL: {generated_sql[:100]}...")
+
+        logger_api.info(f"NL-to-SQL successful. Generated SQL (start): {generated_sql[:100]}...")
         return NLQueryResponse(generated_sql=generated_sql)
 
-    except HTTPException as http_exc: # Re-raise user-facing errors (like 404s from filtering)
-         raise http_exc
-    except DeadlineExceeded: logger_api.error("Gemini API call timed out."); raise HTTPException(504, "NL-to-SQL generation timed out.")
-    except GoogleAPICallError as e: logger_api.error(f"Gemini API call error: {e}"); raise HTTPException(502, f"Error communicating with AI service: {str(e)}")
-    except Exception as e: logger_api.error(f"Error during NL-to-SQL generation: {e}", exc_info=True); raise HTTPException(500, f"Failed to generate SQL: {str(e)}")
+    except HTTPException as http_exc:
+        # Re-raise HTTPExceptions (like 400s, 404s from schema/input validation) directly
+        raise http_exc
+    except Exception as e: # Catch other errors like DeadlineExceeded, GoogleAPICallError from generate_with_key
+        # Log the full error for debugging
+        logger_api.error(f"Error during NL-to-SQL generation for dataset '{req.dataset_id}', prompt '{req.prompt[:50]}': {e}", exc_info=True)
+        # Provide a generic error to the user, but specific enough if it's a timeout or API issue
+        if "DeadlineExceeded" in str(type(e)): # Crude check, better to catch specific exception if generate_with_key raises it
+            raise HTTPException(status_code=504, detail="NL-to-SQL generation timed out. Please try a simpler prompt or try again later.")
+        elif "GoogleAPICallError" in str(type(e)): # Crude check
+             raise HTTPException(status_code=502, detail=f"Error communicating with AI service for NL-to-SQL: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate SQL due to an unexpected server error: {str(e)}")
+
+
 
 
 # --- Other Endpoints ---
@@ -828,14 +799,18 @@ def get_upload_url(
     # except NotFound: logger_api.error(f"GCS Bucket not found: {API_GCS_BUCKET}"); raise HTTPException(404, f"GCS Bucket '{API_GCS_BUCKET}' not found.")
     # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error generating signed URL for {filename} (dataset: {dataset_id}): {e}", exc_info=True); raise HTTPException(502, f"Error communicating with GCS API: {str(e)}")
 
+
+
+
+
 @app.post("/api/trigger-etl", response_model=Dict[str, Any], tags=["ETL"], dependencies=[Depends(verify_token)])
 def trigger_etl(
-    payload: SingleFileETLTriggerClientPayload, # No default (from request body)
-    request: Request,                           # No default (FastAPI provided)
-    background_tasks: BackgroundTasks,          # No default (FastAPI provided)
+    payload: SingleFileETLTriggerClientPayload, # Uses updated model
+    request: Request,                           # FastAPI provided
+    background_tasks: BackgroundTasks,          # FastAPI provided
     current_user: dict = Depends(verify_token),
     publisher: pubsub_v1.PublisherClient = Depends(get_pubsub_publisher),
-    topic_path: str = Depends(get_pubsub_topic_path)                   # Has default
+    topic_path: str = Depends(get_pubsub_topic_path)
 ):
     """
     Triggers the ETL process for a single file, initializes batch tracking in Firestore,
@@ -845,20 +820,11 @@ def trigger_etl(
     if not user_uid:
         logger_api.error("User not authenticated in trigger_etl.")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
-    
 
-
-    # logger_api.info(f"[DEBUG] /api/trigger-etl received payload: {payload.dict()}")
-    # if not api_publisher or not api_topic_path: logger_api.error("Cannot trigger ETL: Publisher client not available."); raise HTTPException(503, "Messaging service unavailable")
-    #if not payload.object_name or not payload.object_name.startswith("uploads/"): logger_api.warning(f"Invalid object_name received for ETL trigger: {payload.object_name}"); raise HTTPException(400, "Invalid object_name provided. Must start with 'uploads/'.")
-    # safe_dataset_prefix = re.sub(r"[^a-zA-Z0-9_]", "_", payload.target_dataset_id)
-    # if not payload.object_name or not payload.target_dataset_id:
-    #      logger_api.warning(f"Invalid payload content for ETL trigger: object_name or target_dataset_id is empty/null. Payload: {payload.dict()}")
-    #      raise HTTPException(400, "Invalid payload content: object_name and target_dataset_id must not be empty.")
-    # client_ip = request.client.host if request.client else "unknown"
-    # logger_api.info(f"Triggering ETL for object: {payload.object_name} (requested by {client_ip})")
-    """Triggers the ETL process by publishing a message to Pub/Sub."""
-    if not payload.object_name or not payload.target_dataset_id: raise HTTPException(400, "Invalid payload.")
+    # --- Basic Payload Sanity Checks (already in your provided code) ---
+    if not payload.object_name or not payload.target_dataset_id:
+        # This should ideally be caught by Pydantic if fields are not Optional and have no default
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Object name and target dataset ID are required.")
     if payload.is_multi_header and payload.header_depth is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="header_depth is required when is_multi_header is true.")
     if not payload.is_multi_header and payload.header_depth is not None:
@@ -866,19 +832,31 @@ def trigger_etl(
             f"header_depth provided for GCS object {payload.object_name} "
             f"by user {user_uid}, but is_multi_header is false. header_depth will be ignored by worker."
         )
-        # payload.header_depth = None # Optionally nullify it before sending to worker
+        # Pydantic model or logic here can decide if payload.header_depth should be set to None
 
-    client_ip = request.client.host if request.client else "unknown_ip" # 'request' is now correctly placed
-    logger_api.info(f"User {user_uid} ({client_ip}) triggering ETL for: {payload.original_file_name} -> GCS: {payload.object_name}")
+    client_ip = request.client.host if request.client else "unknown_ip"
+    logger_api.info(
+        f"User {user_uid} ({client_ip}) triggering ETL for: {payload.original_file_name} -> GCS: {payload.object_name} "
+        f"MultiHeader: {payload.is_multi_header}, Depth: {payload.header_depth}, "
+        f"AICleanup: {payload.apply_ai_smart_cleanup}, TextMode: {payload.text_normalization_mode}, "
+        f"EnableUnpivot: {payload.enable_unpivot}, UnpivotIDs: '{payload.unpivot_id_cols_str}', "
+        f"UnpivotVar: '{payload.unpivot_var_name}', UnpivotVal: '{payload.unpivot_value_name}'"
+    )
 
-    # Prepare file detail for Firestore batch initialization
+    # --- Prepare file detail for Firestore batch initialization ---
+    # (This part includes the new unpivot fields from the payload)
     file_detail_for_batch_init = {
         "original_file_name": payload.original_file_name,
         "gcs_object_name": payload.object_name,
         "is_multi_header": payload.is_multi_header,
         "header_depth": payload.header_depth,
         "apply_ai_smart_cleanup": payload.apply_ai_smart_cleanup,
-        "text_normalization_mode":payload.text_normalization_mode 
+        "text_normalization_mode": payload.text_normalization_mode,
+        # +++ Include unpivot settings for Firestore logging/tracking if desired +++
+        "enable_unpivot": payload.enable_unpivot,
+        "unpivot_id_cols_str": payload.unpivot_id_cols_str, # Log the string version
+        "unpivot_var_name": payload.unpivot_var_name,
+        "unpivot_value_name": payload.unpivot_value_name,
     }
 
     batch_init_response = initialize_batch_status_in_firestore(user_uid, [file_detail_for_batch_init])
@@ -894,12 +872,28 @@ def trigger_etl(
         logger_api.error(f"Critical error: File ID not found for {payload.original_file_name} in batch {batch_id} after Firestore initialization.")
         try:
             get_firestore_client().collection(ETL_BATCHES_COLLECTION).document(batch_id).update({
-             "overallBatchStatus": "error_internal",
-             "internalErrorMessage": "Failed to retrieve file_id post-initialization."
-         })
+                "overallBatchStatus": "error_internal",
+                "internalErrorMessage": "Failed to retrieve file_id post-initialization."
+            })
         except Exception as fs_clean_err:
             logger_api.error(f"Failed to mark batch {batch_id} as errored after file_id retrieval failure: {fs_clean_err}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error creating file tracking ID.")
+
+    # --- Prepare Pub/Sub Message ---
+    unpivot_id_cols_list_for_worker: Optional[List[str]] = None
+    if payload.enable_unpivot and payload.unpivot_id_cols_str: # unpivot_id_cols_str validated by Pydantic
+        unpivot_id_cols_list_for_worker = [col.strip() for col in payload.unpivot_id_cols_str.split(',') if col.strip()]
+        if not unpivot_id_cols_list_for_worker:
+            # This case means the string was all commas/whitespace, or became empty after Pydantic's processing.
+            # The Pydantic validator should ideally prevent this if unpivot_id_cols_str is mandatory when enable_unpivot is true.
+            # If it still gets here, we might disable unpivot for the worker or raise error.
+            logger_api.warning(f"Unpivot was enabled for '{payload.original_file_name}' but ID columns list is effectively empty. Disabling unpivot for worker.")
+            payload.enable_unpivot = False # Override for safety
+
+    # Ensure var_name and value_name have defaults for PubSub payload if unpivot is enabled
+    # The Pydantic model `ETLRequestPubSubPayload` already has defaults, but we can be explicit.
+    var_name_for_worker = payload.unpivot_var_name if payload.enable_unpivot and payload.unpivot_var_name and payload.unpivot_var_name.strip() else "Attribute"
+    value_name_for_worker = payload.unpivot_value_name if payload.enable_unpivot and payload.unpivot_value_name and payload.unpivot_value_name.strip() else "Value"
 
     pubsub_message_payload = ETLRequestPubSubPayload(
         object_name=payload.object_name,
@@ -910,24 +904,32 @@ def trigger_etl(
         file_id=file_id,
         original_file_name=payload.original_file_name,
         apply_ai_smart_cleanup=payload.apply_ai_smart_cleanup,
-        text_normalization_mode=payload.text_normalization_mode 
+        text_normalization_mode=payload.text_normalization_mode if payload.apply_ai_smart_cleanup else None,
+        # +++ Set unpivot fields for Pub/Sub message +++
+        enable_unpivot=payload.enable_unpivot, # Use potentially overridden value
+        unpivot_id_cols_list=unpivot_id_cols_list_for_worker if payload.enable_unpivot else None,
+        unpivot_var_name=var_name_for_worker, # Use determined name
+        unpivot_value_name=value_name_for_worker  # Use determined name
     )
-    message_data_dict = pubsub_message_payload.model_dump()
+    message_data_dict = pubsub_message_payload.model_dump() # For Pydantic v2, or .dict() for v1
     data_bytes = json.dumps(message_data_dict).encode("utf-8")
     logger_api.info(f"Attempting to publish to Pub/Sub. Full payload being serialized: {message_data_dict}")
+    
     try:
         future = publisher.publish(topic_path, data=data_bytes)
         logger_api.debug(f"Pub/Sub message publish initiated for batch {batch_id}, file {file_id}.")
-        def pubsub_result_callback(f):
+        
+        def pubsub_result_callback(f): # Keep f as is for future's result
             try:
                 message_id_published = f.result() 
                 logger_api.info(
                     f"Pub/Sub message published successfully for Batch: {batch_id}, FileID: {file_id}, "
-                    f"OriginalName: {payload.original_file_name}. Pub/Sub Message ID: {message_id_published}."
-                    f"Payload: {message_data_dict}"
+                    f"OriginalName: {payload.original_file_name}. Pub/Sub Message ID: {message_id_published}. "
+                    f"Payload: {message_data_dict}" # Log the actual sent payload
                 )
             except Exception as pub_e_fail:
                 logger_api.error(f"Pub/Sub publish FAILED for Batch: {batch_id}, FileID: {file_id}: {pub_e_fail}", exc_info=True)
+                # Prepare payload for Firestore update on failure
                 error_payload_for_firestore = WorkerFileCompletionPayload(
                     batch_id=batch_id,
                     file_id=file_id,
@@ -935,10 +937,11 @@ def trigger_etl(
                     success=False,
                     error_message="Failed to queue for processing (Pub/Sub publish error)."
                 )
-                background_tasks.add_task(update_file_status_in_firestore, error_payload_for_firestore) # 'background_tasks' is now correctly placed
+                background_tasks.add_task(update_file_status_in_firestore, error_payload_for_firestore)
 
         future.add_done_callback(pubsub_result_callback)
 
+        # Update Firestore status to indicate it's been sent to the worker queue
         get_firestore_client().collection(ETL_BATCHES_COLLECTION).document(batch_id).update({
              f"files.{file_id}.status": "triggered_to_worker",
              f"files.{file_id}.lastUpdated": datetime.now(timezone.utc).isoformat()
@@ -949,7 +952,7 @@ def trigger_etl(
 
     except Exception as e: 
         logger_api.error(f"Error during Pub/Sub publish or Firestore update for {payload.original_file_name} (Batch {batch_id}): {e}", exc_info=True)
-        if batch_id and file_id: 
+        if batch_id and file_id: # Ensure we have IDs to report failure against
             error_payload = WorkerFileCompletionPayload(
                 batch_id=batch_id,
                 file_id=file_id, 
@@ -959,7 +962,6 @@ def trigger_etl(
             )
             background_tasks.add_task(update_file_status_in_firestore, error_payload)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not fully trigger ETL processing: {str(e)}")
-
 
 
 

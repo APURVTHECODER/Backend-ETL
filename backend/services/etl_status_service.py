@@ -67,6 +67,10 @@ def initialize_batch_status_in_firestore(
             "header_depth": file_detail.get("header_depth") ,
             "apply_ai_smart_cleanup": file_detail.get("apply_ai_smart_cleanup", False),
             "text_normalization_mode": file_detail.get("text_normalization_mode"),
+            "enable_unpivot": file_detail.get("enable_unpivot", False),
+            "unpivot_id_cols_str": file_detail.get("unpivot_id_cols_str"), # Log the string version user provided
+            "unpivot_var_name": file_detail.get("unpivot_var_name"),
+            "unpivot_value_name": file_detail.get("unpivot_value_name"),
         }
 
     initial_batch_data = {
