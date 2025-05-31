@@ -28,6 +28,7 @@ from services.etl_status_service import (
     update_file_status_in_firestore,
     ETL_BATCHES_COLLECTION # If you need to refer to the collection name directly
 )
+from services.usage_tracking_service import log_nl_query_event
 # Google Cloud Libraries
 from google.cloud import bigquery, storage, pubsub_v1
 from google.cloud.exceptions import NotFound, BadRequest , Conflict
@@ -110,7 +111,7 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     unpivot_id_cols_str: Optional[str] = Field(None, description="Comma-separated string of ID columns for unpivot.")
     unpivot_var_name: Optional[str] = Field(None, description="Name for the new attribute/variable column.")
     unpivot_value_name: Optional[str] = Field(None, description="Name for the new value column.")
-
+    file_size_bytes: Optional[int] = Field(None, description="Size of the file in bytes, provided by frontend.")
 
 
     @validator('text_normalization_mode', pre=True, always=True)
@@ -148,6 +149,15 @@ class FeedbackImageUploadUrlRequest(BaseModel):
     # You could add user_uid here if you want to make the GCS path user-specific,
     # but it's also available from the token in the endpoint.
 
+class FinalizeNLQueryLogRequest(BaseModel):
+    # job_id is in path
+    final_job_status: str # "FAILED", "SUCCESS_DML"
+    job_error_message: Optional[str] = None
+    rows_affected_dml: Optional[int] = None # For DML
+    bytes_processed: Optional[int] = None
+    duration_ms: Optional[int] = None
+
+
 class FeedbackImageUploadUrlResponse(BaseModel):
     upload_url: str
     gcs_object_name: str # The full path in GCS where the file will be stored
@@ -160,6 +170,14 @@ class BulkDeleteResponseDetail(BaseModel):
     table_id: str
     status: str # "deleted", "error", "not_found", "forbidden"
     message: Optional[str] = None
+
+class NLQueryCompletionMetrics(BaseModel):
+    job_id: str = Field(..., description="The BigQuery Job ID.")
+    final_job_status: str = Field(..., description="Final status: SUCCESS or FAILED.")
+    job_error_message: Optional[str] = None
+    rows_processed: Optional[int] = None # From total_rows_in_result_set or num_dml_affected_rows
+    bytes_processed: Optional[int] = None
+    duration_ms: Optional[int] = None
 
 class BulkDeleteSummaryResponse(BaseModel):
     dataset_id: str
@@ -190,6 +208,9 @@ class WorkerFileCompletionPayload(BaseModel):
     original_file_name: str # For logging/verification
     success: bool
     error_message: Optional[str] = None
+    tables_created_count: Optional[int] = None
+    total_rows_loaded: Optional[int] = None
+    processing_duration_ms_worker: Optional[int] = None # Name
     # Optional: You could add more details like num_tables_processed, bq_table_ids, etc.
 # --- Pydantic Models ---
 # --- Pydantic Models for Prompt Suggestion ---
@@ -230,6 +251,11 @@ class QueryRequest(BaseModel):
     default_dataset: str | None = None # Expecting "project.dataset" format
     max_bytes_billed: int | None = None
     location: str | None = None # Make location optional if client might not always know it
+    original_nl_prompt: Optional[str] = None
+    ai_mode_for_log: Optional[str] = None
+    selected_tables_for_log: Optional[List[str]] = None
+    selected_columns_for_log: Optional[List[str]] = None
+
 class JobSubmitResponse(BaseModel):
     job_id: str
     state: str
@@ -327,7 +353,53 @@ def serialize_bq_schema(schema: List[bigquery.schema.SchemaField]) -> List[Dict[
 SCHEMA_CACHE = {}
 SCHEMA_CACHE_EXPIRY_SECONDS = 3600 # 1 hour
 
+@bq_router.post("/jobs/{job_id}/log-completion", status_code=status.HTTP_202_ACCEPTED) # Alt: make it part of bq_router
+def update_nl_query_log_with_completion_metrics(
+    payload: NLQueryCompletionMetrics,
+    job_id_path: str = Path(..., alias="job_id", description="BigQuery Job ID from path"), # Get job_id from path
+    current_user: dict = Depends(verify_token),
+    client = Depends(get_firestore_client) # Use 'client' for consistency
+):
+    user_uid = current_user.get("uid")
+    if not user_uid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
 
+    if payload.job_id != job_id_path: # Sanity check
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job ID in path and payload do not match.")
+
+    logger_api.info(f"Received request to update NL query log for user {user_uid}, job {payload.job_id} with status {payload.final_job_status}")
+
+    try:
+        query_logs_ref = client.collection("usage_metrics").document(user_uid).collection("nl_query_logs")
+        
+        # Query for the document with the matching jobId
+        docs_generator = query_logs_ref.where("jobId", "==", payload.job_id).limit(1).stream()
+        
+        doc_to_update_ref = None
+        for doc in docs_generator: # Should be at most one
+            doc_to_update_ref = doc.reference
+            break # Found it
+
+        if doc_to_update_ref:
+            update_data = {
+                "jobStatus": payload.final_job_status,
+                "jobErrorMessage": payload.job_error_message,
+                "rowsProcessedByJob": payload.rows_processed,
+                "bytesProcessedByJob": payload.bytes_processed,
+                "durationMsJob": payload.duration_ms,
+                "timestampJobCompleted": datetime.now(timezone.utc) # Add a completion timestamp
+            }
+            update_data_cleaned = {k: v for k, v in update_data.items() if v is not None}
+            doc_to_update_ref.update(update_data_cleaned)
+            logger_api.info(f"Successfully updated NL query log for user {user_uid}, job {payload.job_id}.")
+            return {"message": "Query log updated successfully."}
+        else:
+            logger_api.warning(f"Could not find initial NL query log entry for user {user_uid}, job {payload.job_id} to update.")
+            return {"message": "Initial query log not found for update."}
+
+    except Exception as e:
+        logger_api.error(f"Failed to update NL query log for user {user_uid}, job {payload.job_id}: {e}", exc_info=True)
+        return {"message": f"Error updating query log: {str(e)}"}
 
 def get_dataset_schema(dataset_id: str, bq_client: bigquery.Client) -> List[TableSchema]:
     """Fetches schema for all tables in a dataset."""
@@ -620,8 +692,15 @@ Generated BigQuery SQL Query:
 @bq_router.post("/jobs", response_model=JobSubmitResponse, status_code=202)
 def submit_bigquery_job(
     req: QueryRequest,
+    background_tasks: BackgroundTasks, # Inject BackgroundTasks
+    current_user: dict = Depends(verify_token),
     bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+    
 ):
+    user_uid = current_user.get("uid")
+    if not user_uid: # Should be caught by verify_token
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
+    logger_api.info(f"User {user_uid} submitting job. NL Prompt for log: '{req.original_nl_prompt[:50] if req.original_nl_prompt else 'N/A'}'")
     """Submits a BigQuery job."""
     if not req.sql or req.sql.isspace(): raise HTTPException(400, "SQL query required.")
     logger_api.info(f"Submitting job: {req.sql[:100]}...")
@@ -632,6 +711,22 @@ def submit_bigquery_job(
     if req.max_bytes_billed is not None: job_config.maximum_bytes_billed = req.max_bytes_billed
     try:
         query_job = bq_client.query(req.sql, job_config=job_config, location=req.location or DEFAULT_BQ_LOCATION) # Use injected client
+                # +++ Log the initial query submission event +++
+        log_payload = {
+            "user_id": user_uid,
+            "dataset_id": req.default_dataset or API_GCP_PROJECT, # Use default_dataset if provided, else project ID
+            "ai_mode": req.ai_mode_for_log,
+            "natural_language_prompt": req.original_nl_prompt,
+            "generated_sql": req.sql, # This is the SQL being run
+            "job_id": query_job.job_id,
+            "job_status": "BQ_JOB_SUBMITTED", # Initial status after submission
+            "api_call_duration_ms": None, # Can't easily measure full API call duration here for background task
+            "selected_tables": req.selected_tables_for_log,
+            "selected_columns": req.selected_columns_for_log,
+            # BQ job details like rows, bytes, duration_ms will be updated later
+        }
+        background_tasks.add_task(log_nl_query_event, **log_payload)
+        logger_api.info(f"Initial NL Query usage event dispatched for logging for job {query_job.job_id}")
         return JobSubmitResponse(job_id=query_job.job_id, state=query_job.state, location=query_job.location)
     except BadRequest as e: logger_api.error(f"Invalid Query: {e}"); raise HTTPException(400, f"Invalid query: {str(e)}")
     except GoogleAPICallError as e: logger_api.error(f"BQ API Error: {e}", exc_info=True); raise HTTPException(502, f"BQ API Error: {str(e)}")
@@ -734,41 +829,124 @@ def get_bigquery_job_status(
 
 
 
-
 @bq_router.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
 def get_bigquery_job_results(
-    job_id: str = Path(...),
-    location: str = Query(DEFAULT_BQ_LOCATION),
-    page_token: Optional[str] = Query(None),
-    max_results: int = Query(100, ge=1, le=1000),
-    bq_client: bigquery.Client = Depends(get_bigquery_client) # Inject client
+    job_id: str = Path(..., description="The BigQuery Job ID"), # Ensure Path is imported from fastapi
+    location: str = Query(DEFAULT_BQ_LOCATION, description="The location where the job ran"),
+    page_token: Optional[str] = Query(None, description="Page token for pagination"),
+    max_results: int = Query(100, ge=1, le=1000, description="Maximum number of results per page"),
+    current_user: dict = Depends(verify_token), # To get user_uid for logging
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
+    db = Depends(get_firestore_client) # Inject Firestore client
 ):
-    """Gets the results of a completed BigQuery job."""
-    logger_api.debug(f"Fetching results Job ID: {job_id}, Location: {location}")
-    # if not api_bigquery_client: raise HTTPException(503, "BigQuery client not available.")
-    # logger_api.debug(f"Fetching results for Job ID: {job_id}, Location: {location}, PageToken: {page_token}, MaxResults: {max_results}")
+    """
+    Gets the results of a completed BigQuery job and updates the usage log
+    with final metrics for successful SELECT queries.
+    """
+    user_uid = current_user.get("uid")
+    if not user_uid:
+        # This should ideally be caught by verify_token itself
+        logger_api.error(f"Job results endpoint: User UID missing from token for job {job_id}.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User authentication error.")
+
+    logger_api.debug(f"User {user_uid} fetching results for Job ID: {job_id}, Location: {location}, PageToken: {page_token}")
+
     try:
-        job = bq_client.get_job(job_id, location=location) # Use injected client
-        if job.state != 'DONE': raise HTTPException(400, f"Job not complete: {job.state}")
-        if job.error_result: err_msg = job.error_result.get('message', 'Unknown'); raise HTTPException(400, f"Job failed: {err_msg}")
-        if not job.destination: logger_api.info(f"Job {job_id} had no dest table."); affected_rows = getattr(job, 'num_dml_affected_rows', 0); return JobResultsResponse(rows=[], total_rows_in_result_set=affected_rows or 0, schema=[])
-        rows_iterator = bq_client.list_rows(job.destination, max_results=max_results, page_token=page_token, timeout=DEFAULT_JOB_TIMEOUT_SECONDS) # Use injected client
-        # job = api_bigquery_client.get_job(job_id, location=location)
-        # if job.state != 'DONE': raise HTTPException(400, f"Job {job_id} is not complete. Current state: {job.state}")
-        # if job.error_result: error_msg = job.error_result.get('message', 'Unknown error'); raise HTTPException(400, f"Job {job_id} failed: {error_msg}")
-        # if not job.destination: logger_api.info(f"Job {job_id} completed but did not produce a destination table."); affected_rows = getattr(job, 'num_dml_affected_rows', 0); return JobResultsResponse(rows=[], total_rows_in_result_set=affected_rows if affected_rows is not None else 0, schema=[])
-        # rows_iterator = api_bigquery_client.list_rows(job.destination, max_results=max_results, page_token=page_token, timeout=DEFAULT_JOB_TIMEOUT_SECONDS)
+        job = bq_client.get_job(job_id, location=location)
+
+        if job.state != 'DONE':
+            logger_api.warning(f"User {user_uid}, Job {job_id}: Attempt to get results for incomplete job (State: {job.state}).")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {job_id} is not complete. Current state: {job.state}")
+        
+        if job.error_result:
+            err_msg = job.error_result.get('message', 'Unknown BigQuery error during job execution')
+            logger_api.warning(f"User {user_uid}, Job {job_id}: Job failed: {err_msg}.")
+            # The frontend's fetchJobStatus will call the /log-final-status endpoint for FAILED jobs.
+            # So, no specific log update here for failed jobs from the /results endpoint.
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job {job_id} failed: {err_msg}")
+
+        if not job.destination:
+            logger_api.info(f"User {user_uid}, Job {job_id}: Job (e.g., DML) had no destination table. Rows affected: {getattr(job, 'num_dml_affected_rows', 0)}")
+            # Frontend's fetchJobStatus calls /log-final-status for DML.
+            return JobResultsResponse(
+                rows=[], 
+                total_rows_in_result_set=getattr(job, 'num_dml_affected_rows', 0), 
+                schema=[]
+            )
+
+        # Proceed to fetch rows for successful SELECT-like queries
+        logger_api.debug(f"User {user_uid}, Job {job_id}: Fetching rows from destination table {job.destination.table_id}.")
+        rows_iterator = bq_client.list_rows(
+            job.destination, 
+            max_results=max_results, 
+            page_token=page_token, 
+            timeout=DEFAULT_JOB_TIMEOUT_SECONDS
+        )
+        
         serialized_rows = [serialize_bq_row(row) for row in rows_iterator]
-        schema_info = serialize_bq_schema(rows_iterator.schema)
-        return JobResultsResponse(rows=serialized_rows, total_rows_in_result_set=rows_iterator.total_rows, next_page_token=rows_iterator.next_page_token, schema=schema_info)
-    except NotFound: logger_api.warning(f"Job/results not found: {job_id}"); raise HTTPException(404, f"Job '{job_id}' results not found.")
-    except GoogleAPICallError as e: logger_api.error(f"BQ API Error fetching results: {e}"); raise HTTPException(502, f"BQ API Error: {str(e)}")
-    except Exception as e: logger_api.error(f"Error fetching results: {e}"); raise HTTPException(500, f"Unexpected job results error: {str(e)}")
-    # except NotFound: logger_api.warning(f"Job or destination table not found for job {job_id} in location {location}"); raise HTTPException(404, f"Job '{job_id}' or its results not found in location '{location}'.")
-    # except GoogleAPICallError as e: logger_api.error(f"Google API Call Error fetching job results: {e}", exc_info=True); raise HTTPException(502, f"Error communicating with BigQuery API: {str(e)}")
-    # except Exception as e: logger_api.error(f"Unexpected error fetching job results for {job_id}: {e}", exc_info=True); raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
+        schema_info_list = rows_iterator.schema # This is List[SchemaField]
+        schema_info_for_response = serialize_bq_schema(schema_info_list) # Convert to List[Dict]
 
+        # +++ Update Firestore usage_metrics log for successful SELECT query +++
+        # This update happens when the first page of results is successfully fetched.
+        # Subsequent paginated calls to this endpoint won't re-update the log unless you add specific logic.
+        if job.statement_type == "SELECT" or job.statement_type is None: # Assume None is also SELECT for safety
+            if not page_token: # Only update on the first page request to avoid multiple updates for same job
+                try:
+                    query_logs_ref = db.collection("usage_metrics").document(user_uid).collection("nl_query_logs")
+                    # Find the document by jobId. This requires jobId to be indexed in this subcollection.
+                    docs_generator = query_logs_ref.where("jobId", "==", job_id).limit(1).stream()
+                    
+                    doc_to_update_ref = None
+                    for doc_snap in docs_generator: # Should ideally be one document
+                        doc_to_update_ref = doc_snap.reference
+                        break
+                    
+                    if doc_to_update_ref:
+                        duration_ms = None
+                        if job.ended and job.started:
+                            duration_ms = int((job.ended - job.started).total_seconds() * 1000)
+                        
+                        update_data = {
+                            "jobStatus": "SUCCESS",
+                            "jobErrorMessage": None, # Clear any previous hypothetical error
+                            "rowsProcessedByJob": rows_iterator.total_rows, # Total rows in the *result set*
+                            "bytesProcessedByJob": job.total_bytes_processed,
+                            "durationMsJob": duration_ms,
+                            "timestampJobCompleted": datetime.now(timezone.utc) # Or job.ended if preferred
+                        }
+                        # Filter out None values before updating
+                        update_data_cleaned = {k: v for k, v in update_data.items() if v is not None}
+                        
+                        doc_to_update_ref.update(update_data_cleaned)
+                        logger_api.info(f"User {user_uid}, Job {job_id}: Successfully updated nl_query_log with completion metrics. Rows: {rows_iterator.total_rows}")
+                    else:
+                        logger_api.warning(f"User {user_uid}, Job {job_id}: Could not find initial NL query log entry to update with completion metrics.")
+                        # Consider creating a new log entry here if the initial one was missed, though it implies an issue elsewhere.
+                        # For MVP, just logging a warning is okay.
 
+                except Exception as e_log_update:
+                    logger_api.error(f"User {user_uid}, Job {job_id}: Failed to update NL query usage log with completion metrics: {e_log_update}", exc_info=True)
+                    # Do not let logging failure break the results delivery to the user.
+            else:
+                logger_api.debug(f"User {user_uid}, Job {job_id}: Paginated results request, skipping usage log update.")
+
+        return JobResultsResponse(
+            rows=serialized_rows, 
+            total_rows_in_result_set=rows_iterator.total_rows, 
+            next_page_token=rows_iterator.next_page_token, 
+            schema=schema_info_for_response # Use the serialized schema
+        )
+
+    except NotFound:
+        logger_api.warning(f"User {user_uid}, Job {job_id}: Job or its results destination not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' or its results not found.")
+    except GoogleAPICallError as e:
+        logger_api.error(f"User {user_uid}, Job {job_id}: BQ API Error fetching results: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BigQuery API Error: {str(e)}")
+    except Exception as e:
+        logger_api.error(f"User {user_uid}, Job {job_id}: Unexpected error fetching results: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error retrieving job results: {str(e)}")
 
 # --- Upload/ETL Endpoints ---
 @app.get("/api/upload-url", tags=["Upload"], dependencies=[Depends(verify_token)])
@@ -860,6 +1038,8 @@ def trigger_etl(
     file_detail_for_batch_init = {
         "original_file_name": payload.original_file_name,
         "gcs_object_name": payload.object_name,
+        "target_dataset_id": payload.target_dataset_id,
+        "file_size_bytes": payload.file_size_bytes,
         "is_multi_header": payload.is_multi_header,
         "header_depth": payload.header_depth,
         "apply_ai_smart_cleanup": payload.apply_ai_smart_cleanup,
@@ -1943,7 +2123,48 @@ def delete_bigquery_workspace(
         logger_api.error(f"Admin {admin_uid}: Unexpected error deleting workspace '{full_dataset_id_for_bq}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected server error occurred during workspace deletion: {str(e)}")
     
+# @usage_router.post("/nl-query-logs/{job_id}/finalize")
+@bq_router.post("/jobs/{job_id}/log-final-status", status_code=status.HTTP_202_ACCEPTED)  # Keeping with bq_router
+async def finalize_nl_query_log_status(
+    payload: FinalizeNLQueryLogRequest,
+    job_id: str = Path(...),
+    current_user: dict = Depends(verify_token),
+    client = Depends(get_firestore_client)  # Use 'client' for consistency
+):
+    user_uid = current_user.get("uid")
+    if not user_uid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not authenticated.")
 
+    logger_api.info(f"Request to finalize NL query log for user {user_uid}, job {job_id} with status {payload.final_job_status}")
+    try:
+        query_logs_ref = client.collection("usage_metrics").document(user_uid).collection("nl_query_logs")
+        docs_generator = query_logs_ref.where("jobId", "==", job_id).limit(1).stream()
+
+        doc_to_update_ref = None
+        for doc_snap in docs_generator:
+            doc_to_update_ref = doc_snap.reference
+            break
+
+        if doc_to_update_ref:
+            update_data = {
+                "jobStatus": payload.final_job_status,
+                "jobErrorMessage": payload.job_error_message,
+                "rowsProcessedByJob": payload.rows_affected_dml,  # Use this field for DML
+                "bytesProcessedByJob": payload.bytes_processed,
+                "durationMsJob": payload.duration_ms,
+                "timestampJobCompleted": datetime.now(timezone.utc)
+            }
+            update_data_cleaned = {k: v for k, v in update_data.items() if v is not None}
+            doc_to_update_ref.update(update_data_cleaned)
+            logger_api.info(f"Finalized NL query log for user {user_uid}, job {job_id}.")
+            return {"message": "Query log finalized."}
+        else:
+            logger_api.warning(f"No initial log found for job {job_id} by user {user_uid} to finalize.")
+            return {"message": "Initial query log not found for finalization."}
+
+    except Exception as e:
+        logger_api.error(f"Failed to finalize NL query log for job {job_id}: {e}", exc_info=True)
+        return {"message": f"Error finalizing query log: {str(e)}"}
 
 # --- NEW /api/internal/etl-file-completed (called by worker) ---
 @app.post("/api/internal/etl-file-completed", tags=["ETL Internal"], include_in_schema=False)
