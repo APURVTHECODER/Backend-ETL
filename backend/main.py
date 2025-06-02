@@ -49,7 +49,7 @@ from dependencies.client_deps import (
     get_pubsub_publisher,
     get_pubsub_topic_path
 )
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, Field, conint, validator
 from services.etl_status_service import WorkerFileCompletionPayload
 # Utilities
 import pandas as pd
@@ -103,7 +103,14 @@ class SingleFileETLTriggerClientPayload(BaseModel):
     original_file_name: str = Field(..., description="The original name of the file uploaded by the user")
     is_multi_header: Optional[bool] = Field(default=False)
     header_depth: Optional[conint(ge=1, le=10)] = Field(None) # ge=1 means min 1 if provided
+    apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
+    text_normalization_mode: Optional[str] = Field(None, description="Selected AI text normalization mode if smart cleanup is enabled.")
 
+    @validator('text_normalization_mode', pre=True, always=True)
+    def set_text_normalization_mode_if_cleanup_disabled(cls, v, values):
+        if 'apply_ai_smart_cleanup' in values and not values['apply_ai_smart_cleanup']:
+            return None # Ensure mode is None if cleanup is off
+        return v
 
 class FeedbackImageUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="The original name of the image file.")
@@ -126,6 +133,8 @@ class ETLRequestPubSubPayload(BaseModel):
     batch_id: str             # UUID for the batch this file belongs to
     file_id: str              # UUID for this specific file processing task
     original_file_name: str
+    apply_ai_smart_cleanup: Optional[bool] = False # NEW
+    text_normalization_mode: Optional[str] = None 
 
 # Payload from ETL Worker to report file completion status
 class WorkerFileCompletionPayload(BaseModel):
@@ -188,6 +197,7 @@ class ETLRequest(BaseModel):
         # +++ NEW FIELDS FOR MULTI-HEADER +++
     is_multi_header: Optional[bool] = Field(default=False, description="Indicates if the file has multi-level headers.")
     header_depth: Optional[conint(ge=1, le=10)] = Field(None, description="Number of rows making up the header, if multi-header. Min 1, Max 10.")
+    apply_ai_smart_cleanup: Optional[bool] = Field(default=False, description="Whether to apply AI-based data value cleaning.") 
 # +++ MODIFICATION END +++
 class ColumnInfo(BaseModel): name: str; type: str; mode: str
 class TableSchema(BaseModel): table_id: str; columns: List[ColumnInfo]
@@ -866,7 +876,9 @@ def trigger_etl(
         "original_file_name": payload.original_file_name,
         "gcs_object_name": payload.object_name,
         "is_multi_header": payload.is_multi_header,
-        "header_depth": payload.header_depth
+        "header_depth": payload.header_depth,
+        "apply_ai_smart_cleanup": payload.apply_ai_smart_cleanup,
+        "text_normalization_mode":payload.text_normalization_mode 
     }
 
     batch_init_response = initialize_batch_status_in_firestore(user_uid, [file_detail_for_batch_init])
@@ -896,10 +908,13 @@ def trigger_etl(
         header_depth=payload.header_depth,
         batch_id=batch_id,
         file_id=file_id,
-        original_file_name=payload.original_file_name
+        original_file_name=payload.original_file_name,
+        apply_ai_smart_cleanup=payload.apply_ai_smart_cleanup,
+        text_normalization_mode=payload.text_normalization_mode 
     )
     message_data_dict = pubsub_message_payload.model_dump()
     data_bytes = json.dumps(message_data_dict).encode("utf-8")
+    logger_api.info(f"Attempting to publish to Pub/Sub. Full payload being serialized: {message_data_dict}")
     try:
         future = publisher.publish(topic_path, data=data_bytes)
         logger_api.debug(f"Pub/Sub message publish initiated for batch {batch_id}, file {file_id}.")
